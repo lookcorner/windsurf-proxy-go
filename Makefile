@@ -1,6 +1,6 @@
 # Windsurf Proxy Go - Makefile
 
-.PHONY: build clean test docker run help
+.PHONY: build clean test docker run help wails-dev wails-build wails-build-all
 
 # Go parameters
 GOCMD=go
@@ -8,6 +8,10 @@ GOBUILD=$(GOCMD) build
 GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
 GOGET=$(GOCMD) get
+
+# Wails parameters
+WAILS=wails
+DESKTOP_DIR=desktop
 
 # Binary names
 BINARY_NAME=windsurf-proxy
@@ -76,3 +80,16 @@ install: ## Install binary to system
 
 uninstall: ## Uninstall binary
 	rm -f /usr/local/bin/$(BINARY_NAME)
+
+# Wails Desktop App
+wails-dev: ## Run wails desktop app in development mode
+	cd $(DESKTOP_DIR) && $(WAILS) dev
+
+wails-build: ## Build wails desktop app for current platform
+	cd $(DESKTOP_DIR) && $(WAILS) build
+
+wails-build-all: ## Build wails desktop app for all platforms
+	cd $(DESKTOP_DIR) && $(WAILS) build -platform darwin/amd64,darwin/arm64,windows/amd64,linux/amd64
+
+wails-clean: ## Clean wails build artifacts
+	rm -rf $(DESKTOP_DIR)/build/bin

@@ -143,6 +143,47 @@ curl http://localhost:8000/v1/chat/completions \
 
 完整模型列表见 `internal/core/model_map.go`。
 
+## 桌面应用
+
+本项目提供 Wails 桌面 GUI 应用，用于管理代理服务和查看请求历史。
+
+### 前置要求
+
+- [Wails v2](https://wails.io/docs/gettingstarted/installation/) 已安装
+- Node.js 18+ (用于前端构建)
+
+安装 Wails：
+```bash
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+wails doctor  # 检查依赖
+```
+
+### 开发模式
+
+```bash
+make wails-dev
+```
+
+### 构建
+
+```bash
+# 当前平台
+make wails-build
+
+# 所有平台
+make wails-build-all
+```
+
+构建产物位于 `desktop/build/bin/` 目录。
+
+### 功能
+
+- 实例管理（添加/删除 Windsurf 实例）
+- API Key 管理
+- 请求历史查看
+- 实时日志监控
+- 仪表盘统计
+
 ## 开发
 
 ### 项目结构
@@ -150,6 +191,12 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 windsurf-proxy-go/
 ├── cmd/windsurf-proxy/main.go      # CLI 入口
+├── desktop/                        # Wails 桌面应用
+│   ├── main.go                     # Wails 入口
+│   ├── app.go                      # 应用逻辑
+│   ├── frontend/                   # React 前端
+│   ├── wails.json                  # Wails 配置
+│   └── build/                      # 构建资源
 ├── internal/
 │   ├── api/                        # OpenAI 兼容 API
 │   ├── auth/                       # Firebase 认证 + 凭证发现

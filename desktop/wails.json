@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Windsurf Proxy",
+  "outputfilename": "Windsurf Proxy",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "rentong",
+    "email": "rentong@example.com"
+  },
+  "info": {
+    "companyName": "Windsurf Proxy",
+    "productName": "Windsurf Proxy",
+    "productVersion": "1.1.0",
+    "copyright": "Copyright © 2025",
+    "comments": "Windsurf AI model proxy with OpenAI-compatible API"
+  }
+}

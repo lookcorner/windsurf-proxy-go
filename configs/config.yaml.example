@@ -1,0 +1,20 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+api_keys:
+  - key: "sk-windsurf-change-me"
+    name: "default"
+    rate_limit: 60
+    allowed_models: ["*"]
+
+instances:
+  - name: "local"
+    type: "local"
+    auto_discover: true
+    weight: 10
+
+balancing:
+  strategy: "round_robin"
+  health_check_interval: 30
+  max_retries: 3

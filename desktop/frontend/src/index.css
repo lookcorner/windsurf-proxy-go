@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+:root {
+  --bg-color: #f8f9fa;
+  --sidebar-bg: rgba(255, 255, 255, 0.7);
+  --card-bg: #ffffff;
+  --border-color: #e9ecef;
+  --text-main: #1a1a1a;
+  --text-muted: #6c757d;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --glass-blur: blur(12px);
+}
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family:
+    "Inter",
+    -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+}
+
+/* Allow text selection for copyable content */
+code,
+pre,
+.ant-table,
+.ant-input,
+.ant-select-selector,
+.ant-typography {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+
+/* Wails window-drag region. Used at the very top of the sidebar so the
+   user can drag the window from there and so the macOS native traffic
+   light buttons sit in their own clean strip. Interactive elements
+   inside still need pointer events, so opt them out below. */
+.window-drag {
+  --wails-draggable: drag;
+  -webkit-app-region: drag;
+}
+.window-drag button,
+.window-drag a,
+.window-drag input,
+.window-drag .ant-menu-item {
+  --wails-draggable: no-drag;
+  -webkit-app-region: no-drag;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+}
+
+#root {
+  height: 100vh;
+  width: 100vw;
+  display: flex;
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.page-enter {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

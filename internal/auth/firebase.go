@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
-var httpClient = &http.Client{
-	Timeout: 15 * time.Second,
-}
+const authRequestTimeout = 15 * time.Second
 
 // commonHeaders returns common headers for Firebase requests.
 func commonHeaders() map[string]string {
@@ -29,6 +29,12 @@ func commonHeaders() map[string]string {
 
 // FirebaseSignIn signs in with email + password via Firebase Identity Toolkit.
 func FirebaseSignIn(ctx context.Context, email string, password string) (*FirebaseTokens, error) {
+	return FirebaseSignInWithProxy(ctx, email, password, "")
+}
+
+// FirebaseSignInWithProxy signs in with email + password via Firebase Identity Toolkit using
+// the provided outbound proxy when set.
+func FirebaseSignInWithProxy(ctx context.Context, email string, password string, proxyURL string) (*FirebaseTokens, error) {
 	body := map[string]interface{}{
 		"returnSecureToken": true,
 		"email":             email,
@@ -36,7 +42,7 @@ func FirebaseSignIn(ctx context.Context, email string, password string) (*Fireba
 		"clientType":        "CLIENT_TYPE_WEB",
 	}
 
-	resp, err := doRequest(ctx, FirebaseSignInURL, body)
+	resp, err := doRequest(ctx, FirebaseSignInURL, body, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +92,17 @@ func FirebaseSignIn(ctx context.Context, email string, password string) (*Fireba
 
 // RegisterWindsurfUser exchanges Firebase idToken for Windsurf service API key.
 func RegisterWindsurfUser(ctx context.Context, idToken string) (*WindsurfServiceAuth, error) {
+	return RegisterWindsurfUserWithProxy(ctx, idToken, "")
+}
+
+// RegisterWindsurfUserWithProxy exchanges Firebase idToken for Windsurf service API key using
+// the provided outbound proxy when set.
+func RegisterWindsurfUserWithProxy(ctx context.Context, idToken string, proxyURL string) (*WindsurfServiceAuth, error) {
 	body := map[string]interface{}{
 		"firebase_id_token": idToken,
 	}
 
-	resp, err := doRequest(ctx, RegisterUserURL, body)
+	resp, err := doRequest(ctx, RegisterUserURL, body, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -124,12 +136,18 @@ func RegisterWindsurfUser(ctx context.Context, idToken string) (*WindsurfService
 
 // RefreshFirebaseToken refreshes a Firebase idToken using a refresh token.
 func RefreshFirebaseToken(ctx context.Context, refreshToken string) (*FirebaseTokens, error) {
+	return RefreshFirebaseTokenWithProxy(ctx, refreshToken, "")
+}
+
+// RefreshFirebaseTokenWithProxy refreshes a Firebase idToken using a refresh token and the
+// provided outbound proxy when set.
+func RefreshFirebaseTokenWithProxy(ctx context.Context, refreshToken string, proxyURL string) (*FirebaseTokens, error) {
 	body := map[string]interface{}{
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
 	}
 
-	resp, err := doRequest(ctx, FirebaseRefreshURL, body)
+	resp, err := doRequest(ctx, FirebaseRefreshURL, body, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -173,12 +191,17 @@ func RefreshFirebaseToken(ctx context.Context, refreshToken string) (*FirebaseTo
 
 // FullLogin performs the complete login flow: Firebase sign-in → RegisterUser.
 func FullLogin(ctx context.Context, email string, password string) (*WindsurfServiceAuth, *FirebaseTokens, error) {
-	tokens, err := FirebaseSignIn(ctx, email, password)
+	return FullLoginWithProxy(ctx, email, password, "")
+}
+
+// FullLoginWithProxy performs the complete login flow using the provided outbound proxy when set.
+func FullLoginWithProxy(ctx context.Context, email string, password string, proxyURL string) (*WindsurfServiceAuth, *FirebaseTokens, error) {
+	tokens, err := FirebaseSignInWithProxy(ctx, email, password, proxyURL)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	service, err := RegisterWindsurfUser(ctx, tokens.IDToken)
+	service, err := RegisterWindsurfUserWithProxy(ctx, tokens.IDToken, proxyURL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -187,7 +210,7 @@ func FullLogin(ctx context.Context, email string, password string) (*WindsurfSer
 }
 
 // doRequest makes an HTTP request with JSON body.
-func doRequest(ctx context.Context, url string, body interface{}) ([]byte, error) {
+func doRequest(ctx context.Context, url string, body interface{}, proxyURL string) ([]byte, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -200,6 +223,11 @@ func doRequest(ctx context.Context, url string, body interface{}) ([]byte, error
 
 	for k, v := range commonHeaders() {
 		req.Header.Set(k, v)
+	}
+
+	httpClient, err := clientForProxy(proxyURL)
+	if err != nil {
+		return nil, err
 	}
 
 	resp, err := httpClient.Do(req)
@@ -218,4 +246,29 @@ func doRequest(ctx context.Context, url string, body interface{}) ([]byte, error
 	}
 
 	return data, nil
+}
+
+func clientForProxy(proxyURL string) (*http.Client, error) {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("unexpected default HTTP transport type %T", http.DefaultTransport)
+	}
+
+	cloned := transport.Clone()
+	proxyURL = strings.TrimSpace(proxyURL)
+	switch {
+	case proxyURL == "":
+		cloned.Proxy = http.ProxyFromEnvironment
+	default:
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL %q: %w", proxyURL, err)
+		}
+		cloned.Proxy = http.ProxyURL(parsed)
+	}
+
+	return &http.Client{
+		Timeout:   authRequestTimeout,
+		Transport: cloned,
+	}, nil
 }

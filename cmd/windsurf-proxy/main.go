@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"windsurf-proxy-go/internal/accounts"
 	"windsurf-proxy-go/internal/api"
 	"windsurf-proxy-go/internal/audit"
 	"windsurf-proxy-go/internal/balancer"
@@ -86,8 +87,10 @@ func main() {
 		log.Printf("API key auth disabled — all requests allowed")
 	}
 
+	accountMgr := accounts.NewManager(cfg)
+
 	// Create load balancer
-	bal := balancer.New(&cfg.Balancing)
+	bal := balancer.New(&cfg.Balancing, accountMgr)
 
 	// Initialize instances from config
 	bal.InitFromConfigs(cfg.Instances)
@@ -96,7 +99,7 @@ func main() {
 	bal.StartHealthChecks()
 
 	// Create management handler
-	mgmtHandler := management.NewHandler(bal, keyMgr, cfg, *configPath)
+	mgmtHandler := management.NewHandler(bal, keyMgr, accountMgr, cfg, *configPath)
 	mgmtHandler.SetLoggingChangedHandler(func(next config.LoggingConfig) {
 		if next.Audit {
 			if path, err := audit.Enable(logDir); err != nil {
@@ -115,7 +118,7 @@ func main() {
 	management.InitLogHook(mgmtHandler)
 
 	// Create API handler
-	handler := api.NewHandler(bal, keyMgr, cfg, mgmtHandler.RecordRequest)
+	handler := api.NewHandler(bal, accountMgr, keyMgr, cfg, mgmtHandler.RecordRequest)
 
 	// Create HTTP server
 	mux := http.NewServeMux()
@@ -143,6 +146,7 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down...")
+	mgmtHandler.Stop()
 
 	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -150,6 +154,7 @@ func main() {
 
 	server.Shutdown(ctx)
 	bal.Stop()
+	accountMgr.Stop()
 
 	log.Println("Server stopped")
 }

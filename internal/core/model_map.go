@@ -2,6 +2,7 @@
 package core
 
 import (
+	"sort"
 	"strings"
 )
 
@@ -399,7 +400,10 @@ var ModelNameToUID = map[string]string{
 	"claude-4.6-sonnet-thinking-1m": "claude-sonnet-4-6-thinking-1m",
 
 	// Claude 4.7 (dash-format UIDs, reasoning effort variants; native 1M context)
-	"claude-4.7-opus":        "claude-opus-4-7-low",
+	// Keep the bare Anthropic-style name on the broadly supported medium-effort
+	// tier. Some upstream providers reject low effort for Opus 4.7, which then
+	// surfaces through Cascade as a generic internal error.
+	"claude-4.7-opus":        "claude-opus-4-7-medium",
 	"claude-4.7-opus-low":    "claude-opus-4-7-low",
 	"claude-4.7-opus-medium": "claude-opus-4-7-medium",
 	"claude-4.7-opus-high":   "claude-opus-4-7-high",
@@ -558,6 +562,8 @@ var ModelNameToUID = map[string]string{
 	"swe-1.6-fast":     "swe-1-6-fast",
 }
 
+var modelEnumToNames = buildModelEnumToNames()
+
 // ResolvedModel represents a resolved model with enum and UID.
 type ResolvedModel struct {
 	EnumValue ModelEnum
@@ -591,6 +597,34 @@ func ResolveModel(modelName string) ResolvedModel {
 	}
 }
 
+// CanonicalModelKey returns a stable lowercased internal model key without
+// falling back to an unrelated default model when the input is unknown.
+func CanonicalModelKey(modelName string) string {
+	normalized := normalizeModelName(modelName)
+	if normalized == "" {
+		return ""
+	}
+	normalized = ResolveAnthropicAlias(normalized)
+	if IsModelSupported(normalized) {
+		return ResolveModel(normalized).ModelName
+	}
+	return normalized
+}
+
+// ModelFamilyKey collapses effort-tier suffixes so account policies can allow
+// a model family like claude-4.7-opus while requests target concrete efforts
+// such as claude-4.7-opus-low or claude-4.7-opus-max.
+func ModelFamilyKey(modelName string) string {
+	key := CanonicalModelKey(modelName)
+	for {
+		next := stripModelVariantSuffix(key)
+		if next == key {
+			return key
+		}
+		key = next
+	}
+}
+
 // GetModelUID returns the Windsurf model UID for Cascade session.
 func GetModelUID(modelName string) string {
 	return ModelNameToUID[normalizeModelName(modelName)]
@@ -602,6 +636,29 @@ func IsModelSupported(modelName string) bool {
 	_, hasEnum := ModelNameToEnum[normalized]
 	_, hasUID := ModelNameToUID[normalized]
 	return hasEnum || hasUID
+}
+
+// LookupModelEnum returns the exact Windsurf enum for a canonical model name
+// without falling back to an unrelated default model.
+func LookupModelEnum(modelName string) (ModelEnum, bool) {
+	normalized := CanonicalModelKey(modelName)
+	if normalized == "" {
+		return 0, false
+	}
+	enum, ok := ModelNameToEnum[normalized]
+	return enum, ok
+}
+
+// ModelNamesForEnum returns the canonical internal model names mapped to a
+// Windsurf enum value.
+func ModelNamesForEnum(enum ModelEnum) []string {
+	names := modelEnumToNames[enum]
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, len(names))
+	copy(out, names)
+	return out
 }
 
 // GetSupportedModels returns sorted list of all supported model names.
@@ -624,5 +681,40 @@ func GetSupportedModels() []string {
 func normalizeModelName(name string) string {
 	// Simple normalization: lowercase, trim spaces
 	result := strings.ToLower(strings.TrimSpace(name))
+	return result
+}
+
+func stripModelVariantSuffix(name string) string {
+	suffixes := []string{
+		"-xhigh-priority",
+		"-high-priority",
+		"-medium-priority",
+		"-low-priority",
+		"-none-priority",
+		"-priority",
+		"-xhigh",
+		"-high",
+		"-medium",
+		"-low",
+		"-max",
+		"-minimal",
+		"-none",
+	}
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(name, suffix) {
+			return strings.TrimSuffix(name, suffix)
+		}
+	}
+	return name
+}
+
+func buildModelEnumToNames() map[ModelEnum][]string {
+	result := make(map[ModelEnum][]string)
+	for name, enum := range ModelNameToEnum {
+		result[enum] = append(result[enum], name)
+	}
+	for enum := range result {
+		sort.Strings(result[enum])
+	}
 	return result
 }

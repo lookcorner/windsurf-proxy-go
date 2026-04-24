@@ -22,6 +22,12 @@ var AnthropicModelAliases = map[string]string{
 	"claude-3-5-sonnet-latest":   "claude-3.5-sonnet",
 	"claude-3-5-haiku-20241022":  "claude-3.5-haiku",
 	"claude-3-5-haiku-latest":    "claude-3.5-haiku",
+	// Claude Code may use this snapshot for background/title work. Windsurf
+	// currently routes claude-3.5-haiku through a flaky provider path, so use
+	// the stable native SWE model for these small Claude Code side requests.
+	"claude-haiku-4-5-20251001": "swe-1.5",
+	"claude-haiku-4-5":          "swe-1.5",
+	"claude-haiku-4-5-latest":   "swe-1.5",
 
 	// Claude 3.7
 	"claude-3-7-sonnet-20250219": "claude-3.7-sonnet",
@@ -52,9 +58,8 @@ var AnthropicModelAliases = map[string]string{
 	"claude-sonnet-4-6-latest": "claude-4.6-sonnet",
 	"claude-opus-4-6":          "claude-4.6-opus",
 
-	// Claude 4.7 (effort-tiered, native 1M context). The bare/-latest names
-	// fall back to the project's "default = low" convention used by the
-	// dash-form UID table; explicit tiers map straight through.
+	// Claude 4.7 (effort-tiered, native 1M context). Bare/-latest names stay
+	// generic here; ResolveModel decides the default effort tier.
 	"claude-opus-4-7":        "claude-4.7-opus",
 	"claude-opus-4-7-latest": "claude-4.7-opus",
 	"claude-opus-4-7-low":    "claude-4.7-opus-low",

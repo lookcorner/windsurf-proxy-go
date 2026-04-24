@@ -16,6 +16,7 @@ const appName = "windsurf-proxy"
 type Config struct {
 	Server    ServerConfig     `yaml:"server"`
 	APIKeys   []APIKeyEntry    `yaml:"api_keys"`
+	Accounts  []AccountConfig  `yaml:"accounts"`
 	Instances []InstanceConfig `yaml:"instances"`
 	Balancing BalancingConfig  `yaml:"balancing"`
 	Logging   LoggingConfig    `yaml:"logging"`
@@ -48,6 +49,23 @@ type APIKeyEntry struct {
 	AllowedModels []string `yaml:"allowed_models"`
 }
 
+// AccountConfig represents a standalone account that can back one or more
+// runtime instances.
+type AccountConfig struct {
+	ID                    string   `yaml:"id"`
+	Name                  string   `yaml:"name"`
+	Status                string   `yaml:"status"`
+	Email                 string   `yaml:"email"`
+	Password              string   `yaml:"password"`
+	APIKey                string   `yaml:"api_key"`
+	APIServer             string   `yaml:"api_server"`
+	Proxy                 string   `yaml:"proxy"`
+	AvailableModels       []string `yaml:"available_models"`
+	SyncedAvailableModels []string `yaml:"synced_available_models"`
+	BlockedModels         []string `yaml:"blocked_models"`
+	FirebaseRefreshToken  string   `yaml:"firebase_refresh_token"`
+}
+
 // InstanceConfig represents a Windsurf instance configuration.
 type InstanceConfig struct {
 	Name         string `yaml:"name"`
@@ -57,16 +75,13 @@ type InstanceConfig struct {
 	GRPCPort     int    `yaml:"grpc_port"`
 	CSRFToken    string `yaml:"csrf_token"`
 	APIKey       string `yaml:"api_key"`
+	Proxy        string `yaml:"proxy"`
 	Weight       int    `yaml:"weight"`
+	AccountID    string `yaml:"account_id"`
 	// Standalone mode
-	Email      string `yaml:"email"`
-	Password   string `yaml:"password"`
 	BinaryPath string `yaml:"binary_path"`
 	ServerPort int    `yaml:"server_port"`
 	Version    string `yaml:"version"`
-	// Remote mode
-	APIServer            string `yaml:"api_server"`
-	FirebaseRefreshToken string `yaml:"firebase_refresh_token"`
 }
 
 // BalancingConfig represents load balancing configuration.
@@ -93,6 +108,7 @@ func DefaultConfig() *Config {
 				AllowedModels: []string{"*"},
 			},
 		},
+		Accounts: []AccountConfig{},
 		Instances: []InstanceConfig{
 			{
 				Name:         "local",

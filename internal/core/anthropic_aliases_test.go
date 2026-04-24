@@ -23,6 +23,7 @@ func TestResolveAnthropicAliasStripsContextSuffix(t *testing.T) {
 		// Plain alias path keeps working.
 		{"claude-sonnet-4-6", "claude-4.6-sonnet"},
 		{"claude-3-5-sonnet-latest", "claude-3.5-sonnet"},
+		{"claude-haiku-4-5-20251001", "swe-1.5"},
 
 		// Unknown model — pass through (lower/trim only).
 		{"some-future-model", "some-future-model"},
@@ -51,5 +52,36 @@ func TestStripContextSuffix(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("stripContextSuffix(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestResolveModelClaude47DefaultUsesMedium(t *testing.T) {
+	internal := ResolveAnthropicAlias("claude-opus-4-7")
+	if internal != "claude-4.7-opus" {
+		t.Fatalf("ResolveAnthropicAlias() = %q, want %q", internal, "claude-4.7-opus")
+	}
+
+	resolved := ResolveModel(internal)
+	if resolved.ModelUID != "claude-opus-4-7-medium" {
+		t.Fatalf("ResolveModel(%q).ModelUID = %q, want %q", internal, resolved.ModelUID, "claude-opus-4-7-medium")
+	}
+}
+
+func TestResolveModelClaude47ExplicitMaxStillUsesMax(t *testing.T) {
+	resolved := ResolveModel("claude-4.7-opus-max")
+	if resolved.ModelUID != "claude-opus-4-7-max" {
+		t.Fatalf("ResolveModel(%q).ModelUID = %q, want %q", "claude-4.7-opus-max", resolved.ModelUID, "claude-opus-4-7-max")
+	}
+}
+
+func TestResolveModelClaude45HaikuUsesSWE(t *testing.T) {
+	internal := ResolveAnthropicAlias("claude-haiku-4-5-20251001")
+	if internal != "swe-1.5" {
+		t.Fatalf("ResolveAnthropicAlias() = %q, want %q", internal, "swe-1.5")
+	}
+
+	resolved := ResolveModel(internal)
+	if resolved.ModelUID != "MODEL_SWE_1_5" {
+		t.Fatalf("ResolveModel(%q).ModelUID = %q, want %q", internal, resolved.ModelUID, "MODEL_SWE_1_5")
 	}
 }

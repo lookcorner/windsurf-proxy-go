@@ -85,6 +85,213 @@ body {
   animation: fadeIn 0.3s ease-out;
 }
 
+.account-usage-card {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.92)),
+    radial-gradient(circle at 20% 0%, rgba(255, 122, 24, 0.12), transparent 34%);
+  border: 1px solid #e5e7eb;
+  border-radius: 18px;
+  padding: 22px;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.06);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.account-usage-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 24px 54px rgba(15, 23, 42, 0.1);
+}
+
+.account-card-header,
+.account-title-row,
+.account-chip-row,
+.quota-meter-label,
+.quota-balance-row {
+  display: flex;
+  align-items: center;
+}
+
+.account-card-header,
+.quota-meter-label,
+.quota-balance-row {
+  justify-content: space-between;
+}
+
+.account-title-row {
+  gap: 9px;
+}
+
+.account-name {
+  color: #111827;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.account-subtitle {
+  color: #64748b;
+  font-size: 12px;
+  margin-top: 5px;
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-health-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 5px rgba(148, 163, 184, 0.16);
+}
+
+.account-health-dot.ok {
+  background: #10b981;
+  box-shadow: 0 0 0 5px rgba(16, 185, 129, 0.14);
+}
+
+.account-health-dot.warning {
+  background: #f97316;
+  box-shadow: 0 0 0 5px rgba(249, 115, 22, 0.14);
+}
+
+.account-health-dot.danger {
+  background: #ef4444;
+  box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.14);
+}
+
+.account-status-pill {
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 10px;
+  text-transform: uppercase;
+}
+
+.account-status-pill.active {
+  background: #ecfdf5;
+  color: #047857;
+}
+
+.account-status-pill.inactive {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.account-chip-row {
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.account-chip-row span {
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 9px;
+}
+
+.quota-panel {
+  background: #ffffff;
+  border: 1px solid #eef0f3;
+  border-radius: 18px;
+  padding: 18px;
+}
+
+.quota-meter + .quota-meter {
+  margin-top: 17px;
+}
+
+.quota-meter-label {
+  color: #475569;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.quota-meter-label strong,
+.quota-balance-row strong {
+  color: #111827;
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.quota-track {
+  background: #edf0f3;
+  border-radius: 999px;
+  height: 12px;
+  margin: 12px 0;
+  overflow: hidden;
+}
+
+.quota-fill {
+  border-radius: inherit;
+  height: 100%;
+  transition: width 0.35s ease;
+}
+
+.quota-fill.orange {
+  background: linear-gradient(90deg, #ff7a1a, #ff9f1c);
+}
+
+.quota-fill.green {
+  background: linear-gradient(90deg, #10b981, #34d399);
+}
+
+.quota-reset {
+  color: #64748b;
+  font-family: "SFMono-Regular", "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.quota-balance-row {
+  color: #475569;
+  font-size: 15px;
+  font-weight: 700;
+  margin-top: 18px;
+}
+
+.quota-cycle-box {
+  background: #eef4fa;
+  border: 1px solid #dbe5ef;
+  border-radius: 16px;
+  color: #334155;
+  display: grid;
+  gap: 7px;
+  margin: 16px 0;
+  padding: 14px 16px;
+}
+
+.quota-cycle-box strong {
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.quota-cycle-box span {
+  color: #526173;
+  font-family: "SFMono-Regular", "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.account-meta-grid {
+  margin-bottom: 8px;
+}
+
+.account-error-line {
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 12px;
+  color: #c2410c;
+  font-size: 12px;
+  margin: 12px 0 14px;
+  max-height: 52px;
+  overflow: hidden;
+  padding: 10px 12px;
+  text-overflow: ellipsis;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

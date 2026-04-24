@@ -97,7 +97,7 @@ function App() {
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (pingInterval) clearInterval(pingInterval);
     };
-  }, []);
+  }, [addLog]);
 
   const renderPage = () => {
     switch (currentPage) {

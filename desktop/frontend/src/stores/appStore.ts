@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Stats, Instance, ApiKey, AppConfig, RequestRecord } from '@/lib/api';
+import type { Stats, Account, Instance, ApiKey, AppConfig, RequestRecord } from '@/lib/api';
 import * as api from '@/lib/api';
 
 export type Page = 'dashboard' | 'accounts' | 'apikeys' | 'settings' | 'requests' | 'models_view';
@@ -20,6 +20,8 @@ interface AppState {
   loadStats: () => Promise<void>;
 
   // Instances
+  accounts: Account[];
+  loadAccounts: () => Promise<void>;
   instances: Instance[];
   loadInstances: () => Promise<void>;
 
@@ -58,6 +60,16 @@ export const useAppStore = create<AppState>((set) => ({
       set({ stats });
     } catch (e) {
       console.error('Failed to load stats:', e);
+    }
+  },
+
+  accounts: [],
+  loadAccounts: async () => {
+    try {
+      const accounts = await api.fetchAccounts();
+      set({ accounts });
+    } catch (e) {
+      console.error('Failed to load accounts:', e);
     }
   },
 

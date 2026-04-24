@@ -15,7 +15,9 @@ import (
 type TokenManager struct {
 	tokens       *FirebaseTokens
 	serviceAuth  *WindsurfServiceAuth
+	proxyURL     string
 	apiKeyUpdate func(newKey string) // Callback to update language server
+	stateUpdate  func(tokens *FirebaseTokens, auth *WindsurfServiceAuth)
 
 	mu     sync.Mutex
 	stopCh chan struct{}
@@ -30,16 +32,25 @@ const (
 	maxRetries           = 5
 )
 
+var (
+	refreshFirebaseTokenFunc = RefreshFirebaseTokenWithProxy
+	registerWindsurfUserFunc = RegisterWindsurfUserWithProxy
+)
+
 // NewTokenManager creates a new token manager.
 func NewTokenManager(
 	tokens *FirebaseTokens,
 	serviceAuth *WindsurfServiceAuth,
+	proxyURL string,
 	apiKeyUpdate func(newKey string),
+	stateUpdate func(tokens *FirebaseTokens, auth *WindsurfServiceAuth),
 ) *TokenManager {
 	return &TokenManager{
 		tokens:       tokens,
 		serviceAuth:  serviceAuth,
+		proxyURL:     proxyURL,
 		apiKeyUpdate: apiKeyUpdate,
+		stateUpdate:  stateUpdate,
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -134,7 +145,7 @@ func (tm *TokenManager) doRefresh() error {
 	defer cancel()
 
 	// Step 1: Refresh Firebase token
-	newTokens, err := RefreshFirebaseToken(ctx, tm.tokens.RefreshToken)
+	newTokens, err := refreshFirebaseTokenFunc(ctx, tm.tokens.RefreshToken, tm.proxyURL)
 	if err != nil {
 		return fmt.Errorf("Firebase token refresh failed: %w", err)
 	}
@@ -146,7 +157,7 @@ func (tm *TokenManager) doRefresh() error {
 	log.Printf("[TokenManager] Firebase token refreshed (expires_in=%ds)", newTokens.ExpiresIn)
 
 	// Step 2: Re-register to get new service API key
-	newAuth, err := RegisterWindsurfUser(ctx, newTokens.IDToken)
+	newAuth, err := registerWindsurfUserFunc(ctx, newTokens.IDToken, tm.proxyURL)
 	if err != nil {
 		return fmt.Errorf("RegisterWindsurfUser failed: %w", err)
 	}
@@ -155,6 +166,10 @@ func (tm *TokenManager) doRefresh() error {
 	oldKey := tm.serviceAuth.APIKey
 	tm.serviceAuth = newAuth
 	tm.mu.Unlock()
+
+	if tm.stateUpdate != nil {
+		tm.stateUpdate(newTokens, newAuth)
+	}
 
 	// Step 3: Update language server if key changed
 	if newAuth.APIKey != oldKey {

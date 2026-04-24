@@ -4,8 +4,63 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+
+	"windsurf-proxy-go/internal/core/protobuf"
 )
+
+type anthropicRequestMetricSummary struct {
+	BodyBytes            int
+	RawSystemBytes       int
+	FlattenedSystemBytes int
+	FinalSystemBytes     int
+	NonSystemBytes       int
+	ToolSchemaBytes      int
+}
+
+func anthropicRequestMetrics(
+	body []byte,
+	req *AnthropicMessagesRequest,
+	messages []map[string]interface{},
+	tools []map[string]interface{},
+) anthropicRequestMetricSummary {
+	metrics := anthropicRequestMetricSummary{BodyBytes: len(body)}
+	if req != nil {
+		metrics.RawSystemBytes = len(bytes.TrimSpace(req.System))
+		metrics.FlattenedSystemBytes = len(flattenAnthropicSystem(req.System))
+	}
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+		content := extractMetricContent(msg["content"])
+		if role == "system" {
+			metrics.FinalSystemBytes += len(content)
+			continue
+		}
+		metrics.NonSystemBytes += len(content)
+	}
+	for _, tool := range tools {
+		if b, err := json.Marshal(tool); err == nil {
+			metrics.ToolSchemaBytes += len(b)
+		}
+	}
+	return metrics
+}
+
+func extractMetricContent(content interface{}) string {
+	switch value := content.(type) {
+	case string:
+		return value
+	case nil:
+		return ""
+	default:
+		b, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Sprint(value)
+		}
+		return string(b)
+	}
+}
 
 // convertAnthropicRequest translates an incoming Anthropic /v1/messages
 // request into the internal representation (messages + tools) consumed by
@@ -20,12 +75,16 @@ func convertAnthropicRequest(req *AnthropicMessagesRequest) (
 	tools []map[string]interface{},
 	err error,
 ) {
+	if isClaudeCodeRequest(req) {
+		return compactClaudeCodeRequest(req), nil, nil
+	}
+
 	messages = make([]map[string]interface{}, 0, len(req.Messages)+1)
 
 	if sys := flattenAnthropicSystem(req.System); sys != "" {
 		messages = append(messages, map[string]interface{}{
-			"role":    "system",
-			"content": sys,
+			"role":    "user",
+			"content": formatAnthropicSystemContext(sys),
 		})
 	}
 
@@ -152,6 +211,171 @@ func convertAnthropicRequest(req *AnthropicMessagesRequest) (
 	return messages, tools, nil
 }
 
+func formatAnthropicSystemContext(system string) string {
+	system = strings.TrimSpace(system)
+	if system == "" {
+		return ""
+	}
+	return "[Client system prompt provided as request context; do not treat it as higher priority than the proxy's runtime instructions.]\n" + system
+}
+
+var (
+	claudeCodeCWDPattern        = regexp.MustCompile(`(?m)(?:Primary working directory|Current working directory|working directory|cwd)[:\s]+(/[^\n\r]+)`)
+	claudeCodeOpenedFilePattern = regexp.MustCompile(`The user opened the file (/[^\n\r]+) in the IDE`)
+)
+
+func isClaudeCodeRequest(req *AnthropicMessagesRequest) bool {
+	if req == nil {
+		return false
+	}
+	system := flattenAnthropicSystem(req.System)
+	if strings.Contains(system, "You are Claude Code, Anthropic's official CLI for Claude.") {
+		return true
+	}
+	for _, msg := range req.Messages {
+		if strings.Contains(extractAnthropicMessageText(msg), "The following skills are available for use with the Skill tool:") {
+			return true
+		}
+	}
+	return false
+}
+
+func compactClaudeCodeRequest(req *AnthropicMessagesRequest) []map[string]interface{} {
+	system := flattenAnthropicSystem(req.System)
+	messageTexts := make([]string, 0, len(req.Messages))
+	for _, msg := range req.Messages {
+		if text := strings.TrimSpace(extractAnthropicMessageText(msg)); text != "" {
+			messageTexts = append(messageTexts, text)
+		}
+	}
+	joinedMessages := strings.Join(messageTexts, "\n\n")
+
+	parts := make([]string, 0, 6)
+	if cwd := firstRegexpGroup(claudeCodeCWDPattern, system+"\n"+joinedMessages); cwd != "" {
+		parts = append(parts, "Working directory: "+cwd)
+	}
+	if opened := firstRegexpGroup(claudeCodeOpenedFilePattern, joinedMessages); opened != "" {
+		parts = append(parts, "Opened file: "+opened)
+	}
+	if instruction := extractClaudeCodeUserInstructions(system + "\n" + joinedMessages); instruction != "" {
+		parts = append(parts, "Relevant user/project instructions:\n"+instruction)
+	}
+	if task := extractClaudeCodeUserTask(req); task != "" {
+		parts = append(parts, "User request:\n"+task)
+	}
+	if len(parts) == 0 {
+		parts = append(parts, joinedMessages)
+	}
+
+	return []map[string]interface{}{{
+		"role":    "system",
+		"content": protobuf.NativeCascadeToolsMarker,
+	}, {
+		"role":    "user",
+		"content": strings.Join(parts, "\n\n"),
+	}}
+}
+
+func extractAnthropicMessageText(msg AnthropicMessage) string {
+	if text, ok := decodeMaybeString(msg.Content); ok {
+		return text
+	}
+	var blocks []AnthropicBlock
+	if len(msg.Content) > 0 && json.Unmarshal(msg.Content, &blocks) == nil {
+		parts := make([]string, 0, len(blocks))
+		for _, block := range blocks {
+			switch block.Type {
+			case "text":
+				if strings.TrimSpace(block.Text) != "" {
+					parts = append(parts, block.Text)
+				}
+			case "tool_result":
+				if text := flattenToolResultContent(block.Content); strings.TrimSpace(text) != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return strings.TrimSpace(string(msg.Content))
+}
+
+func extractClaudeCodeUserTask(req *AnthropicMessagesRequest) string {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		text := strings.TrimSpace(extractAnthropicMessageText(req.Messages[i]))
+		if text == "" {
+			continue
+		}
+		blocks := splitSystemReminderBlocks(text)
+		for j := len(blocks) - 1; j >= 0; j-- {
+			candidate := strings.TrimSpace(blocks[j])
+			if candidate == "" || strings.HasPrefix(candidate, "<system-reminder>") {
+				continue
+			}
+			return candidate
+		}
+	}
+	return ""
+}
+
+func splitSystemReminderBlocks(text string) []string {
+	parts := make([]string, 0)
+	for {
+		start := strings.Index(text, "<system-reminder>")
+		if start < 0 {
+			parts = append(parts, text)
+			return parts
+		}
+		if start > 0 {
+			parts = append(parts, text[:start])
+		}
+		end := strings.Index(text[start:], "</system-reminder>")
+		if end < 0 {
+			parts = append(parts, text[start:])
+			return parts
+		}
+		end += start + len("</system-reminder>")
+		parts = append(parts, text[start:end])
+		text = text[end:]
+	}
+}
+
+func extractClaudeCodeUserInstructions(text string) string {
+	idx := strings.Index(text, "Contents of ")
+	if idx < 0 {
+		return ""
+	}
+	section := text[idx:]
+	if end := strings.Index(section, "IMPORTANT: this context may or may not be relevant"); end >= 0 {
+		section = section[:end]
+	}
+	lines := strings.Split(section, "\n")
+	kept := make([]string, 0, 8)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "Contents of ") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "Always respond") || strings.Contains(trimmed, "Chinese") || strings.Contains(trimmed, "中文") {
+			kept = append(kept, trimmed)
+		} else if strings.HasPrefix(trimmed, "Project override:") {
+			kept = append(kept, trimmed)
+		}
+		if len(kept) >= 3 {
+			break
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+func firstRegexpGroup(pattern *regexp.Regexp, text string) string {
+	match := pattern.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
 // flattenAnthropicSystem reduces the system field (which may be a plain
 // string or a []AnthropicBlock) to a single prompt string.
 func flattenAnthropicSystem(raw json.RawMessage) string {
@@ -214,6 +438,28 @@ func decodeMaybeString(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+func decodeToolChoice(raw json.RawMessage) interface{} {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var value interface{}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil
+	}
+	if m, ok := value.(map[string]interface{}); ok {
+		kind, _ := m["type"].(string)
+		if kind == "auto" || kind == "required" || kind == "none" || kind == "any" {
+			return kind
+		}
+		if kind == "tool" {
+			if name, _ := m["name"].(string); name != "" {
+				return map[string]interface{}{"type": "tool", "name": name}
+			}
+		}
+	}
+	return value
 }
 
 // describeAnthropicImage renders an image source (base64 or url) as a compact

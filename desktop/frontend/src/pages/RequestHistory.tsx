@@ -35,6 +35,15 @@ export default function RequestHistory() {
       render: (v: string) => v ? <Tag>{v}</Tag> : <span style={{ color: 'var(--text-muted)' }}>-</span>,
     },
     {
+      title: '请求账号',
+      dataIndex: 'account',
+      key: 'account',
+      render: (v: string, record: { instance?: string }) => {
+        if (v) return <Tag color="gold">{v}</Tag>;
+        return <span style={{ color: 'var(--text-muted)' }}>{record.instance ? '本地凭证' : '未路由'}</span>;
+      },
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
@@ -57,6 +66,22 @@ export default function RequestHistory() {
       width: 100,
       render: (v: number) => `${v}ms`,
       sorter: (a: { duration_ms: number }, b: { duration_ms: number }) => a.duration_ms - b.duration_ms,
+    },
+    {
+      title: 'Turns',
+      dataIndex: 'turns',
+      key: 'turns',
+      width: 90,
+      render: (v: number) => v.toLocaleString(),
+      sorter: (a: { turns: number }, b: { turns: number }) => a.turns - b.turns,
+    },
+    {
+      title: 'Prompt Chars',
+      dataIndex: 'prompt_chars',
+      key: 'prompt_chars',
+      width: 120,
+      render: (v: number) => v.toLocaleString(),
+      sorter: (a: { prompt_chars: number }, b: { prompt_chars: number }) => a.prompt_chars - b.prompt_chars,
     },
     {
       title: 'Prompt',
@@ -158,7 +183,7 @@ export default function RequestHistory() {
           pagination={{ pageSize: 50, showTotal: (total) => `共 ${total} 条请求` }}
           size="middle"
           locale={{ emptyText: '暂无请求记录' }}
-          scroll={{ x: 1100 }}
+          scroll={{ x: 1440 }}
         />
       </div>
     </div>

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"windsurf-proxy-go/internal/redact"
 )
 
 // AnthropicSSEWriter writes Anthropic-style named SSE events.
@@ -110,7 +112,7 @@ func (s *AnthropicSSEWriter) WriteTextDelta(index int, text string) error {
 		Index: index,
 		Delta: AnthropicStreamContentDelta{
 			Type: "text_delta",
-			Text: text,
+			Text: redact.SanitizeText(text),
 		},
 	})
 }
@@ -123,7 +125,7 @@ func (s *AnthropicSSEWriter) WriteInputJSONDelta(index int, partial string) erro
 		Index: index,
 		Delta: AnthropicStreamContentDelta{
 			Type:        "input_json_delta",
-			PartialJSON: partial,
+			PartialJSON: redact.SanitizeText(partial),
 		},
 	})
 }
@@ -165,7 +167,7 @@ func (s *AnthropicSSEWriter) WriteError(errType, message string) error {
 		Type: "error",
 		Error: AnthropicErrorDetail{
 			Type:    errType,
-			Message: message,
+			Message: redact.SanitizeText(message),
 		},
 	})
 }

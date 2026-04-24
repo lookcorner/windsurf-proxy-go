@@ -26,18 +26,42 @@ const (
 	GRPCService = "exa.language_server_pb.LanguageServerService"
 
 	// Cascade polling config
-	CascadePollInterval    = 150 * time.Millisecond
-	CascadeMaxPolls        = 2000
-	CascadeInitialWait     = 300 * time.Millisecond
-	CascadeMaxAutoContinue = 8
+	CascadePollInterval           = 150 * time.Millisecond
+	CascadeMaxPolls               = 2000
+	CascadeInitialWait            = 300 * time.Millisecond
+	CascadeMaxAutoContinue        = 8
+	CascadeSendBaseTimeout        = 60 * time.Second
+	CascadeSendMaxTimeout         = 90 * time.Second
+	CascadeSendTimeoutStep        = 10 * time.Second
+	CascadeSendTimeoutStepBytes   = 8000
+	CascadeStablePolls            = 8
+	CascadeForcedStablePolls      = 40
+	CascadePendingNativeToolPolls = 400
 
-	CascadeContinuePrompt = "Continue the current task using the existing conversation context and prior tool results. Do not repeat completed tool calls unless necessary."
+	CascadeContinuePrompt      = "Continue the current task using the existing conversation context and prior tool results. Do not repeat completed tool calls unless necessary."
+	CascadeContinueIdleRetries = 12
+	CascadeContinueIdleDelay   = 250 * time.Millisecond
 )
 
 // StreamEvent represents a stream event from Cascade.
 type StreamEvent struct {
 	Type string
 	Data interface{}
+}
+
+type UserStatus = protobuf.UserStatusSnapshot
+
+func cascadeSendTimeout(text string, systemPrompt string) time.Duration {
+	promptBytes := len(text) + len(systemPrompt)
+	timeout := CascadeSendBaseTimeout + time.Duration(promptBytes/CascadeSendTimeoutStepBytes)*CascadeSendTimeoutStep
+	if timeout > CascadeSendMaxTimeout {
+		return CascadeSendMaxTimeout
+	}
+	return timeout
+}
+
+func isCascadeExecutorNotIdle(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "executor is not idle")
 }
 
 // WindsurfGrpcClient is a gRPC client for Windsurf language server.
@@ -47,6 +71,8 @@ type WindsurfGrpcClient struct {
 	CSRFToken string
 	channel   *grpc.ClientConn
 	mu        sync.Mutex
+	panelMu   sync.Mutex
+	panelInit map[string]string
 }
 
 // NewWindsurfGrpcClient creates a new gRPC client.
@@ -55,6 +81,7 @@ func NewWindsurfGrpcClient(host string, port int, csrfToken string) *WindsurfGrp
 		Host:      host,
 		Port:      port,
 		CSRFToken: csrfToken,
+		panelInit: make(map[string]string),
 	}
 }
 
@@ -161,16 +188,18 @@ func (c *WindsurfGrpcClient) CascadeSend(
 	parentCtx context.Context,
 	cascadeID string,
 	text string,
+	modelEnum core.ModelEnum,
 	modelUID string,
 	apiKey string,
 	version string,
 	systemPrompt string,
 ) error {
 	req := protobuf.BuildSendCascadeMessageRequest(
-		cascadeID, text, modelUID, apiKey, version, systemPrompt,
+		cascadeID, text, int(modelEnum), modelUID, apiKey, version, systemPrompt,
 	)
 
-	ctx, cancel := context.WithTimeout(parentCtx, 60*time.Second)
+	timeout := cascadeSendTimeout(text, systemPrompt)
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	_, err := c.rawCall(ctx, "SendUserCascadeMessage", req)
@@ -193,9 +222,28 @@ func (c *WindsurfGrpcClient) CascadePoll(parentCtx context.Context, cascadeID st
 	return &result, nil
 }
 
+// GetUserStatus fetches plan/quota data for the api key currently routed
+// through this LS transport.
+func (c *WindsurfGrpcClient) GetUserStatus(parentCtx context.Context, apiKey string, version string) (*UserStatus, error) {
+	req := protobuf.BuildGetUserStatusRequest(apiKey, version)
+
+	ctx, cancel := context.WithTimeout(parentCtx, 8*time.Second)
+	defer cancel()
+
+	resp, err := c.rawCall(ctx, "GetUserStatus", req)
+	if err != nil {
+		return nil, err
+	}
+
+	status := protobuf.ParseGetUserStatusResponse(resp)
+	return &status, nil
+}
+
 // ChatStream sends a chat request and yields StreamEvent tuples.
 func (c *WindsurfGrpcClient) ChatStream(
 	ctx context.Context,
+	instanceName string,
+	accountID string,
 	apiKey string,
 	messages []map[string]string,
 	modelEnum core.ModelEnum,
@@ -208,7 +256,7 @@ func (c *WindsurfGrpcClient) ChatStream(
 	log.Printf("[gRPC] ChatStream -> %s:%d model=%s uid=%s", c.Host, c.Port, modelName, modelUID)
 
 	if modelUID != "" {
-		go c.cascadeProducer(ctx, out, apiKey, messages, modelUID, version)
+		go c.cascadeProducer(ctx, out, instanceName, accountID, apiKey, messages, modelEnum, modelUID, version)
 	} else {
 		log.Printf("No model UID for '%s', using RawGetChatMessage", modelName)
 		go c.rawStreamProducer(ctx, out, apiKey, messages, modelEnum, modelName, version)
@@ -224,8 +272,11 @@ var cwdRegex = regexp.MustCompile(`(?i)(?:Primary working directory|Current work
 func (c *WindsurfGrpcClient) cascadeProducer(
 	ctx context.Context,
 	out chan<- StreamEvent,
+	instanceName string,
+	accountID string,
 	apiKey string,
 	messages []map[string]string,
+	modelEnum core.ModelEnum,
 	modelUID string,
 	version string,
 ) {
@@ -248,6 +299,8 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 	if match := cwdRegex.FindStringSubmatch(systemPrompt); match != nil {
 		cwd = strings.TrimSpace(match[1])
 	}
+
+	nativeCascadeTools := strings.Contains(systemPrompt, protobuf.NativeCascadeToolsMarker)
 
 	// Build user text from all non-system messages
 	var userParts []string
@@ -277,28 +330,48 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 		userText = "[Working directory: " + cwd + "]\n\n" + userText
 	}
 
-	log.Printf("[Cascade] user_text length=%d, system_prompt length=%d, cwd=%s, msgs=%d",
-		len(userText), len(systemPrompt), cwd, len(nonSystem))
+	sendTimeout := cascadeSendTimeout(userText, systemPrompt)
+	log.Printf("[Cascade] user_text length=%d, system_prompt length=%d, cwd=%s, msgs=%d send_timeout=%s",
+		len(userText), len(systemPrompt), cwd, len(nonSystem), sendTimeout)
 
-	// Step 1: Start session
+	if err := c.ensureCascadePanelState(apiKey, version, accountID); err != nil {
+		log.Printf("[Cascade] panel init failed: %v", err)
+		out <- StreamEvent{Type: "error", Data: err.Error()}
+		return
+	}
+
+	// GetCascadeTrajectorySteps returns the cumulative trajectory for the
+	// entire cascade session. Reusing cascade_id across API turns causes
+	// old text/tool calls/done markers to bleed into the new turn, so each
+	// request starts a fresh session and carries history in userText.
 	cascadeID, err := c.CascadeStart(ctx, apiKey, version)
 	if err != nil {
 		log.Printf("[Cascade] start failed: %v", err)
-		out <- StreamEvent{Type: "text", Data: "[Error: " + err.Error() + "]"}
+		out <- StreamEvent{Type: "error", Data: err.Error()}
 		return
 	}
 	log.Printf("[Cascade] started: %s", cascadeID)
 
 	// Step 2: Send message
-	err = c.CascadeSend(ctx, cascadeID, userText, modelUID, apiKey, version, systemPrompt)
+	err = c.CascadeSend(ctx, cascadeID, userText, modelEnum, modelUID, apiKey, version, systemPrompt)
+	if isPanelStateMissing(err) {
+		c.invalidateCascadePanelState(accountID)
+		if initErr := c.ensureCascadePanelState(apiKey, version, accountID); initErr != nil {
+			err = initErr
+		} else {
+			log.Printf("[Cascade] panel state initialized on demand, retrying send")
+			err = c.CascadeSend(ctx, cascadeID, userText, modelEnum, modelUID, apiKey, version, systemPrompt)
+		}
+	}
 	if err != nil {
 		log.Printf("[Cascade] send failed: %v", err)
-		out <- StreamEvent{Type: "text", Data: "[Error: " + err.Error() + "]"}
+		out <- StreamEvent{Type: "error", Data: err.Error()}
 		return
 	}
 	log.Printf("[Cascade] message sent (model=%s)", modelUID)
 
 	// Step 3: Poll for response
+	firstVisibleStart := time.Now()
 	time.Sleep(CascadeInitialWait)
 
 	prevText := ""
@@ -306,10 +379,21 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 	seenToolCalls := make(map[string]bool)
 	seenToolResults := make(map[string]bool)
 	emittedAny := false
+	sawModelOutput := false
+	firstVisibleLogged := false
 	contentStableCount := 0
 	autoContinueCount := 0
 	roundToolCallCount := 0
+	lastToolActivityPoll := 0
 	isTextlessModel := !strings.HasPrefix(modelUID, "swe-")
+
+	logFirstVisible := func(kind string, size int) {
+		if firstVisibleLogged {
+			return
+		}
+		firstVisibleLogged = true
+		log.Printf("[Cascade] first visible %s after %s (%d chars)", kind, time.Since(firstVisibleStart), size)
+	}
 
 	for i := 0; i < CascadeMaxPolls; i++ {
 		pollCount := i + 1
@@ -323,13 +407,13 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 		result, err := c.CascadePoll(ctx, cascadeID)
 		if err != nil {
 			log.Printf("[Cascade] poll failed: %v", err)
-			out <- StreamEvent{Type: "text", Data: "[Error: " + err.Error() + "]"}
+			out <- StreamEvent{Type: "error", Data: err.Error()}
 			return
 		}
 
 		if result.Error != "" {
 			log.Printf("[Cascade] error: %s", result.Error)
-			out <- StreamEvent{Type: "text", Data: "[Error: " + result.Error + "]"}
+			out <- StreamEvent{Type: "error", Data: result.Error}
 			return
 		}
 
@@ -348,12 +432,16 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 			}
 			seenToolCalls[sig] = true
 			roundToolCallCount++
+			lastToolActivityPoll = pollCount
 			args := tc.Arguments
 			if len(args) > 100 {
 				args = args[:100] + "..."
 			}
 			log.Printf("[Cascade] tool_call: %s(%s)", tc.Name, args)
-			out <- StreamEvent{Type: "tool_call", Data: tc}
+			logFirstVisible("tool_call", len(tc.Arguments))
+			if !nativeCascadeTools {
+				out <- StreamEvent{Type: "tool_call", Data: tc}
+			}
 		}
 
 		// Emit tool results
@@ -363,17 +451,24 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 				continue
 			}
 			seenToolResults[sig] = true
+			lastToolActivityPoll = pollCount
 			log.Printf("[Cascade] tool_result: %s (%d chars)", tr.ToolName, len(tr.Output))
-			out <- StreamEvent{Type: "tool_result", Data: tr}
+			if !nativeCascadeTools {
+				out <- StreamEvent{Type: "tool_result", Data: tr}
+			}
 		}
 
 		// Emit thinking delta (for textless models)
 		if len(result.Thinking) > len(prevThinking) {
 			delta := result.Thinking[len(prevThinking):]
 			prevThinking = result.Thinking
+			sawModelOutput = true
 			if isTextlessModel {
-				out <- StreamEvent{Type: "text", Data: delta}
-				emittedAny = true
+				logFirstVisible("thinking", len(delta))
+				if !nativeCascadeTools {
+					out <- StreamEvent{Type: "text", Data: delta}
+					emittedAny = true
+				}
 			}
 			contentStableCount = 0
 		}
@@ -382,17 +477,75 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 		if len(result.Text) > len(prevText) {
 			delta := result.Text[len(prevText):]
 			prevText = result.Text
-			out <- StreamEvent{Type: "text", Data: delta}
-			emittedAny = true
+			logFirstVisible("text", len(delta))
+			if !nativeCascadeTools {
+				out <- StreamEvent{Type: "text", Data: delta}
+				emittedAny = true
+			}
+			sawModelOutput = true
 			contentStableCount = 0
 		} else {
 			contentStableCount++
 		}
 
-		// End session when content stabilized
-		if result.Done && contentStableCount >= 30 {
-			// Auto-continue for models that only return tool calls without text
-			if !strings.HasPrefix(modelUID, "swe-") &&
+		pendingNativeTool := nativeCascadeTools && len(seenToolCalls) > len(seenToolResults)
+		if pendingNativeTool {
+			pollsSinceToolActivity := pollCount - lastToolActivityPoll
+			if strings.TrimSpace(prevText) == "" {
+				if pollsSinceToolActivity >= CascadePendingNativeToolPolls {
+					err := fmt.Errorf("native Cascade tool call timed out before final text")
+					log.Printf("[Cascade] %v", err)
+					out <- StreamEvent{Type: "error", Data: err.Error()}
+					return
+				}
+				time.Sleep(CascadePollInterval)
+				continue
+			}
+			if pollsSinceToolActivity < CascadeForcedStablePolls {
+				time.Sleep(CascadePollInterval)
+				continue
+			}
+		}
+
+		forcedStable := !result.Done &&
+			sawModelOutput &&
+			roundToolCallCount == 0 &&
+			contentStableCount >= CascadeForcedStablePolls
+
+		// End session when content stabilized. Some LS builds never surface
+		// the final done marker even after the answer stops changing; in that
+		// case we force completion after a longer quiet window instead of
+		// holding the client open until timeout.
+		if (result.Done && contentStableCount >= CascadeStablePolls) || forcedStable {
+			// Native Cascade often surfaces a transient done marker after a tool
+			// result but before the final answer. Nudge it to continue, but keep
+			// buffering output so Claude Code only sees the final response.
+			if result.Done &&
+				nativeCascadeTools &&
+				strings.TrimSpace(result.Text) == "" {
+				if autoContinueCount >= CascadeMaxAutoContinue {
+					err := fmt.Errorf("native Cascade completed tool calls without final text")
+					log.Printf("[Cascade] %v", err)
+					out <- StreamEvent{Type: "error", Data: err.Error()}
+					return
+				}
+				autoContinueCount++
+				roundToolCallCount = 0
+				contentStableCount = 0
+				log.Printf("[Cascade] auto-continue native round %d for model=%s after tool-only marker",
+					autoContinueCount, modelUID)
+				err = c.CascadeSend(ctx, cascadeID, CascadeContinuePrompt, modelEnum, modelUID, apiKey, version, systemPrompt)
+				if err != nil {
+					log.Printf("[Cascade] native auto-continue send failed: %v", err)
+				}
+				time.Sleep(CascadeInitialWait)
+				continue
+			}
+
+			// Auto-continue for non-native models that only return tool calls without text.
+			if result.Done &&
+				!pendingNativeTool &&
+				!strings.HasPrefix(modelUID, "swe-") &&
 				autoContinueCount < CascadeMaxAutoContinue &&
 				roundToolCallCount > 0 &&
 				strings.TrimSpace(result.Text) == "" {
@@ -403,7 +556,13 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 				log.Printf("[Cascade] auto-continue round %d for model=%s after tool-only completion",
 					autoContinueCount, modelUID)
 
-				err = c.CascadeSend(ctx, cascadeID, CascadeContinuePrompt, modelUID, apiKey, version, systemPrompt)
+				for retry := 0; retry <= CascadeContinueIdleRetries; retry++ {
+					err = c.CascadeSend(ctx, cascadeID, CascadeContinuePrompt, modelEnum, modelUID, apiKey, version, systemPrompt)
+					if !isCascadeExecutorNotIdle(err) {
+						break
+					}
+					time.Sleep(CascadeContinueIdleDelay)
+				}
 				if err != nil {
 					log.Printf("[Cascade] auto-continue send failed: %v", err)
 				}
@@ -411,11 +570,23 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 				continue
 			}
 
-			// Final fallback: if no text was ever emitted but thinking exists, emit it
-			if !emittedAny && result.Thinking != "" {
+			if nativeCascadeTools && strings.TrimSpace(prevText) != "" {
+				out <- StreamEvent{Type: "text", Data: prevText}
+				emittedAny = true
+			}
+
+			// Final fallback: if no text was ever emitted but thinking exists, emit it.
+			// Native Cascade tool mode suppresses thinking because it is often only a
+			// progress sentence, not the final answer.
+			if !nativeCascadeTools && !emittedAny && result.Thinking != "" {
+				logFirstVisible("thinking_fallback", len(result.Thinking))
 				out <- StreamEvent{Type: "text", Data: result.Thinking}
 			}
-			log.Printf("[Cascade] content stabilized after %d polls, ending session", contentStableCount)
+			if forcedStable {
+				log.Printf("[Cascade] content stable for %d polls without done marker, forcing session end", contentStableCount)
+			} else {
+				log.Printf("[Cascade] content stabilized after %d polls, ending session", contentStableCount)
+			}
 			return
 		}
 
@@ -447,7 +618,7 @@ func (c *WindsurfGrpcClient) rawStreamProducer(
 	// Connect and send streaming request
 	channel, err := c.ensureChannel()
 	if err != nil {
-		out <- StreamEvent{Type: "text", Data: "[Error: " + err.Error() + "]"}
+		out <- StreamEvent{Type: "error", Data: err.Error()}
 		return
 	}
 
@@ -465,12 +636,12 @@ func (c *WindsurfGrpcClient) rawStreamProducer(
 	)
 	audit.FromContext(ctx).RecordUpstreamCall(target, "RawGetChatMessage", time.Since(streamT0).Milliseconds(), err)
 	if err != nil {
-		out <- StreamEvent{Type: "text", Data: "[Error: " + err.Error() + "]"}
+		out <- StreamEvent{Type: "error", Data: err.Error()}
 		return
 	}
 
 	if err := stream.SendMsg(req); err != nil {
-		out <- StreamEvent{Type: "text", Data: "[Error: send failed: " + err.Error() + "]"}
+		out <- StreamEvent{Type: "error", Data: "send failed: " + err.Error()}
 		return
 	}
 	// No more client messages on this unary-send / server-stream call.
@@ -488,6 +659,7 @@ func (c *WindsurfGrpcClient) rawStreamProducer(
 		}
 		if err != nil {
 			log.Printf("[Raw] recv error: %v", err)
+			out <- StreamEvent{Type: "error", Data: err.Error()}
 			return
 		}
 		if len(resp) == 0 {
@@ -524,4 +696,42 @@ func (c *WindsurfGrpcClient) InitializeCascadePanelState(apiKey string, version 
 
 	_, err := c.rawCall(ctx, "InitializeCascadePanelState", req)
 	return err
+}
+
+func (c *WindsurfGrpcClient) ensureCascadePanelState(apiKey string, version string, accountID string) error {
+	key := panelStateKey(accountID)
+	signature := apiKey + "|" + version
+
+	c.panelMu.Lock()
+	if c.panelInit[key] == signature {
+		c.panelMu.Unlock()
+		return nil
+	}
+	c.panelMu.Unlock()
+
+	if err := c.InitializeCascadePanelState(apiKey, version); err != nil {
+		return err
+	}
+
+	c.panelMu.Lock()
+	c.panelInit[key] = signature
+	c.panelMu.Unlock()
+	return nil
+}
+
+func (c *WindsurfGrpcClient) invalidateCascadePanelState(accountID string) {
+	c.panelMu.Lock()
+	delete(c.panelInit, panelStateKey(accountID))
+	c.panelMu.Unlock()
+}
+
+func panelStateKey(accountID string) string {
+	if accountID != "" {
+		return "account:" + accountID
+	}
+	return "instance"
+}
+
+func isPanelStateMissing(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "panel state not found")
 }

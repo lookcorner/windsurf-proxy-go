@@ -44,7 +44,7 @@ var userLogTranslations = []struct {
 	{"\\[Balancer\\] Selected instance", "选择实例"},
 	{"\\[Cascade\\] started", "Cascade 会话已开始"},
 	{"\\[Cascade\\] message sent", "消息已发送"},
-	{"\\[Cascade\\] content stabilized", "内容完成，结束会话"},
+	{"\\[Cascade\\] content stabilized", "内容已稳定，结束会话"},
 	{"\\[Cascade\\] auto-continue", "自动继续对话"},
 	{"\\[Cascade\\] tool_call", "工具调用"},
 	{"\\[Cascade\\] tool_result", "工具执行结果"},
@@ -86,6 +86,7 @@ var userLogTranslations = []struct {
 var technicalPatterns = []string{
 	"[gRPC]",
 	"[protobuf]",
+	"[Tool parse]",
 	"[Cascade] poll #",
 	"[LS:",
 	"wire",

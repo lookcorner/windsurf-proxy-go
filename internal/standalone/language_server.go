@@ -22,12 +22,13 @@ import (
 
 // LanguageServerProcess manages a standalone language_server child process.
 type LanguageServerProcess struct {
-	APIKey        string
-	ServerPort    int
-	BinaryPath    string
-	Version       string
-	APIServerURL  string
-	CSRFToken     string
+	APIKey       string
+	ServerPort   int
+	BinaryPath   string
+	Version      string
+	APIServerURL string
+	ProxyURL     string
+	CSRFToken    string
 
 	// Internal state
 	process      *os.Process
@@ -38,15 +39,16 @@ type LanguageServerProcess struct {
 	restartCount int
 	maxRestarts  int
 
-	mu            sync.Mutex
-	monitorStopCh chan struct{}
-	wg            sync.WaitGroup
+	mu             sync.Mutex
+	monitorStopCh  chan struct{}
+	monitorRunning bool
+	wg             sync.WaitGroup
 }
 
 // Default settings
 const (
-	defaultMaxRestarts    = 5
-	defaultExtPortOffset  = 100
+	defaultMaxRestarts   = 5
+	defaultExtPortOffset = 100
 )
 
 // NewLanguageServerProcess creates a new language server process manager.
@@ -56,6 +58,7 @@ func NewLanguageServerProcess(
 	binaryPath string,
 	version string,
 	apiServerURL string,
+	proxyURL string,
 ) (*LanguageServerProcess, error) {
 	// Find binary if not specified
 	binary, err := FindLanguageServerBinary(binaryPath)
@@ -87,6 +90,7 @@ func NewLanguageServerProcess(
 		BinaryPath:    binary,
 		Version:       version,
 		APIServerURL:  apiServerURL,
+		ProxyURL:      strings.TrimSpace(proxyURL),
 		CSRFToken:     uuid.New().String(),
 		dbDir:         dbDir,
 		codeiumDir:    codeiumDir,
@@ -130,12 +134,32 @@ func (ls *LanguageServerProcess) buildArgs() []string {
 func (ls *LanguageServerProcess) buildEnv() []string {
 	env := os.Environ()
 	env = append(env, fmt.Sprintf("WINDSURF_CSRF_TOKEN=%s", ls.CSRFToken))
+	if ls.ProxyURL != "" {
+		env = append(env,
+			fmt.Sprintf("HTTP_PROXY=%s", ls.ProxyURL),
+			fmt.Sprintf("HTTPS_PROXY=%s", ls.ProxyURL),
+			fmt.Sprintf("http_proxy=%s", ls.ProxyURL),
+			fmt.Sprintf("https_proxy=%s", ls.ProxyURL),
+		)
+	}
 	return env
 }
 
 // buildStdinMetadata encodes the Metadata protobuf to send via stdin.
 func (ls *LanguageServerProcess) buildStdinMetadata() []byte {
 	return protobuf.EncodeMetadata(ls.APIKey, ls.Version)
+}
+
+func (ls *LanguageServerProcess) currentAPIKey() string {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return ls.APIKey
+}
+
+func (ls *LanguageServerProcess) setAPIKey(newKey string) {
+	ls.mu.Lock()
+	ls.APIKey = newKey
+	ls.mu.Unlock()
 }
 
 // Start launches the language_server process.
@@ -148,10 +172,15 @@ func (ls *LanguageServerProcess) Start() error {
 		return nil
 	}
 
-	// Kill anything occupying our ports
-	KillPortHolder(ls.ServerPort)
-	KillPortHolder(ls.ServerPort + 1) // lsp_port
-	KillPortHolder(ls.extPort)
+	for _, port := range []int{ls.ServerPort, ls.ServerPort + 1, ls.extPort} {
+		inUse, err := IsPortInUse(port)
+		if err != nil {
+			return fmt.Errorf("check port %d: %w", port, err)
+		}
+		if inUse {
+			return fmt.Errorf("port %d is already in use", port)
+		}
+	}
 
 	// Start dummy extension server
 	var err error
@@ -174,7 +203,11 @@ func (ls *LanguageServerProcess) Start() error {
 	args := ls.buildArgs()
 	env := ls.buildEnv()
 
-	log.Printf("[LS] Starting language_server on port %d (binary=%s)", ls.ServerPort, ls.BinaryPath)
+	if ls.ProxyURL != "" {
+		log.Printf("[LS] Starting language_server on port %d via proxy %s (binary=%s)", ls.ServerPort, MaskProxyForLog(ls.ProxyURL), ls.BinaryPath)
+	} else {
+		log.Printf("[LS] Starting language_server on port %d (binary=%s)", ls.ServerPort, ls.BinaryPath)
+	}
 	log.Printf("[LS] Args: %s", strings.Join(args, " "))
 
 	cmd := exec.Command(args[0], args[1:]...)
@@ -252,7 +285,7 @@ func (ls *LanguageServerProcess) InitializeCascadePanelState() error {
 		client := grpc.NewWindsurfGrpcClient("127.0.0.1", ls.ServerPort, ls.CSRFToken)
 
 		_, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := client.InitializeCascadePanelState(ls.APIKey, ls.Version)
+		err := client.InitializeCascadePanelState(ls.currentAPIKey(), ls.Version)
 		cancel()
 
 		if err == nil {
@@ -283,12 +316,6 @@ func (ls *LanguageServerProcess) StartAndWait(timeout time.Duration) error {
 	// Give gRPC extra time to initialize
 	time.Sleep(2 * time.Second)
 
-	// Initialize Cascade panel state
-	err = ls.InitializeCascadePanelState()
-	if err != nil {
-		return err
-	}
-
 	// Start monitor
 	ls.StartMonitor()
 
@@ -297,23 +324,51 @@ func (ls *LanguageServerProcess) StartAndWait(timeout time.Duration) error {
 
 // StartMonitor starts background monitoring for process health.
 func (ls *LanguageServerProcess) StartMonitor() {
+	ls.mu.Lock()
+	if ls.monitorRunning {
+		ls.mu.Unlock()
+		return
+	}
+	ls.monitorStopCh = make(chan struct{})
+	ls.monitorRunning = true
+	stopCh := ls.monitorStopCh
+	ls.mu.Unlock()
+
 	ls.wg.Add(1)
-	go ls.monitorLoop()
+	go ls.monitorLoop(stopCh)
 }
 
 // StopMonitor stops the background monitor.
 func (ls *LanguageServerProcess) StopMonitor() {
-	close(ls.monitorStopCh)
+	ls.mu.Lock()
+	if !ls.monitorRunning {
+		ls.mu.Unlock()
+		return
+	}
+	stopCh := ls.monitorStopCh
+	ls.monitorStopCh = nil
+	ls.monitorRunning = false
+	ls.mu.Unlock()
+
+	close(stopCh)
 	ls.wg.Wait()
 }
 
 // monitorLoop monitors the LS process and restarts if it dies.
-func (ls *LanguageServerProcess) monitorLoop() {
+func (ls *LanguageServerProcess) monitorLoop(stopCh chan struct{}) {
 	defer ls.wg.Done()
+	defer func() {
+		ls.mu.Lock()
+		if ls.monitorStopCh == stopCh {
+			ls.monitorStopCh = nil
+			ls.monitorRunning = false
+		}
+		ls.mu.Unlock()
+	}()
 
 	for {
 		select {
-		case <-ls.monitorStopCh:
+		case <-stopCh:
 			return
 		case <-time.After(5 * time.Second):
 			// Check process
@@ -344,7 +399,9 @@ func (ls *LanguageServerProcess) monitorLoop() {
 			}
 
 			ls.stopExtensionServer()
+			ls.mu.Lock()
 			ls.process = nil
+			ls.mu.Unlock()
 			time.Sleep(2 * time.Second) // Let OS reclaim ports
 
 			log.Printf("[LS] Restarting (attempt %d)...", count)
@@ -359,9 +416,6 @@ func (ls *LanguageServerProcess) monitorLoop() {
 				log.Printf("[LS] Restart failed — port not ready")
 				return
 			}
-
-			time.Sleep(2 * time.Second)
-			ls.InitializeCascadePanelState()
 		}
 	}
 }
@@ -397,7 +451,6 @@ func (ls *LanguageServerProcess) Shutdown() {
 	}
 
 	ls.stopExtensionServer()
-	KillPortHolder(ls.ServerPort)
 
 	// Clean up temp dirs
 	os.RemoveAll(ls.dbDir)
@@ -406,15 +459,13 @@ func (ls *LanguageServerProcess) Shutdown() {
 	log.Printf("[LS] Language server stopped")
 }
 
-// UpdateAPIKey updates the API key and restarts the process.
+// UpdateAPIKey updates the bootstrap API key used for future process starts.
+// Request-time API keys are sent per gRPC call, so a key refresh must not
+// restart a shared language server that may be serving other accounts.
 func (ls *LanguageServerProcess) UpdateAPIKey(newKey string) error {
-	log.Printf("[LS] Updating API key, restarting language server...")
-	ls.APIKey = newKey
-	ls.Shutdown()
-
-	ls.restartCount = 0 // Reset restart count for intentional restart
-
-	return ls.StartAndWait(30 * time.Second)
+	ls.setAPIKey(newKey)
+	log.Printf("[LS] Updated bootstrap API key without restarting language_server")
+	return nil
 }
 
 // GetClient returns a gRPC client for this language server.

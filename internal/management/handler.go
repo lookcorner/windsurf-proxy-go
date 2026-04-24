@@ -3,6 +3,7 @@ package management
 
 import (
 	"container/list"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"windsurf-proxy-go/internal/accounts"
 	"windsurf-proxy-go/internal/balancer"
 	"windsurf-proxy-go/internal/config"
 	"windsurf-proxy-go/internal/core"
@@ -28,11 +30,14 @@ import (
 type Handler struct {
 	balancer              *balancer.LoadBalancer
 	keys                  *keys.Manager
+	accountMgr            *accounts.Manager
 	config                *config.Config
 	configPath            string
 	startTime             time.Time
 	onServerConfigChanged func(prev, next config.ServerConfig)
 	onLoggingChanged      func(next config.LoggingConfig)
+	refreshCtx            context.Context
+	refreshCancel         context.CancelFunc
 
 	// Request history (ring buffer)
 	requestHistory *list.List
@@ -49,23 +54,47 @@ type Handler struct {
 func NewHandler(
 	bal *balancer.LoadBalancer,
 	keyMgr *keys.Manager,
+	accountMgr *accounts.Manager,
 	cfg *config.Config,
 	configPath string,
 ) *Handler {
-	return &Handler{
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	h := &Handler{
 		balancer:       bal,
 		keys:           keyMgr,
+		accountMgr:     accountMgr,
 		config:         cfg,
 		configPath:     configPath,
 		startTime:      time.Now(),
+		refreshCtx:     refreshCtx,
+		refreshCancel:  refreshCancel,
 		requestHistory: list.New(),
 		maxHistory:     500,
 		logClients:     make(map[*websocket.Conn]bool),
 	}
+	if accountMgr != nil {
+		accountMgr.SetPersistHook(func() {
+			if err := h.saveConfig(); err != nil {
+				log.Printf("Failed to save config after account refresh: %v", err)
+			}
+		})
+		h.startBackgroundAccountRefresh()
+	}
+	return h
+}
+
+// Stop shuts down background loops owned by the management handler.
+func (h *Handler) Stop() {
+	if h == nil || h.refreshCancel == nil {
+		return
+	}
+	h.refreshCancel()
 }
 
 // RegisterRoutes registers management routes on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/accounts", h.localOnly(h.handleAccounts))
+	mux.HandleFunc("/api/accounts/", h.localOnly(h.handleAccount))
 	mux.HandleFunc("/api/instances", h.localOnly(h.handleInstances))
 	mux.HandleFunc("/api/instances/", h.localOnly(h.handleInstance))
 	mux.HandleFunc("/api/keys", h.localOnly(h.handleKeys))
@@ -90,6 +119,424 @@ func (h *Handler) SetLoggingChangedHandler(fn func(next config.LoggingConfig)) {
 }
 
 // ============================================================================
+// Account management
+// ============================================================================
+
+type AccountCreate struct {
+	Name                 string   `json:"name"`
+	Email                string   `json:"email"`
+	Password             string   `json:"password"`
+	APIKey               string   `json:"api_key"`
+	APIServer            string   `json:"api_server"`
+	Proxy                string   `json:"proxy"`
+	AvailableModels      []string `json:"available_models"`
+	BlockedModels        []string `json:"blocked_models"`
+	FirebaseRefreshToken string   `json:"firebase_refresh_token"`
+}
+
+type accountRefreshResult struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	AuthSource     string `json:"auth_source"`
+	HasAPIKey      bool   `json:"has_api_key"`
+	UsageStatus    string `json:"usage_status"`
+	QuotaExhausted bool   `json:"quota_exhausted"`
+	Error          string `json:"error,omitempty"`
+}
+
+const (
+	accountRefreshTimeout          = 30 * time.Second
+	accountRefreshRetryDelay       = 3 * time.Second
+	accountBatchRefreshConcurrency = 4
+	accountBackgroundRefreshDelay  = 15 * time.Second
+	accountBackgroundRefreshPeriod = 5 * time.Minute
+)
+
+func (h *Handler) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.listAccounts(w, r)
+	case http.MethodPost:
+		h.createAccount(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleAccount(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path)
+	if len(parts) < 3 {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method == http.MethodPost && len(parts) == 3 && parts[2] == "refresh-all" {
+		h.refreshAllAccounts(w, r)
+		return
+	}
+
+	id := parts[2]
+	if r.Method == http.MethodPost && len(parts) >= 4 && parts[3] == "refresh" {
+		h.refreshAccount(w, r, id)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		h.deleteAccount(w, r, id)
+		return
+	}
+
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
+	accountsList := []accounts.View{}
+	if h.accountMgr != nil {
+		accountsList = h.accountMgr.List(h.config.Instances)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"accounts": accountsList})
+}
+
+func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
+	if h.accountMgr == nil {
+		http.Error(w, "Account manager not available", http.StatusInternalServerError)
+		return
+	}
+
+	var body AccountCreate
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	id := "acct_" + generateHex(10)
+	entry, err := h.accountMgr.Add(config.AccountConfig{
+		ID:                   id,
+		Name:                 strings.TrimSpace(body.Name),
+		Email:                strings.TrimSpace(body.Email),
+		Password:             body.Password,
+		APIKey:               strings.TrimSpace(body.APIKey),
+		APIServer:            strings.TrimSpace(body.APIServer),
+		Proxy:                strings.TrimSpace(body.Proxy),
+		AvailableModels:      body.AvailableModels,
+		BlockedModels:        body.BlockedModels,
+		FirebaseRefreshToken: strings.TrimSpace(body.FirebaseRefreshToken),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.saveConfig(); err != nil {
+		log.Printf("Failed to save config: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"id":     entry.ID,
+		"name":   entry.Name,
+	})
+}
+
+func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request, id string) {
+	if h.accountMgr == nil {
+		http.Error(w, "Account manager not available", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.accountMgr.Remove(id, h.config.Instances); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	for i := range h.config.Instances {
+		if h.config.Instances[i].Type == "standalone" && h.config.Instances[i].AccountID == id {
+			h.config.Instances[i].AccountID = ""
+		}
+	}
+
+	if err := h.saveConfig(); err != nil {
+		log.Printf("Failed to save config: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "deleted": id})
+}
+
+func (h *Handler) refreshAccount(w http.ResponseWriter, r *http.Request, id string) {
+	if h.accountMgr == nil {
+		http.Error(w, "Account manager not available", http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), accountRefreshTimeout)
+	defer cancel()
+
+	result, err := h.refreshOneAccount(ctx, id, true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "result": result})
+}
+
+func (h *Handler) refreshAllAccounts(w http.ResponseWriter, r *http.Request) {
+	if h.accountMgr == nil {
+		http.Error(w, "Account manager not available", http.StatusInternalServerError)
+		return
+	}
+
+	entries := make([]config.AccountConfig, 0, len(h.config.Accounts))
+	for _, entry := range h.config.Accounts {
+		if strings.TrimSpace(entry.ID) == "" {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+
+	results := h.refreshAccountsBatch(r.Context(), entries)
+
+	succeeded := 0
+	failed := 0
+	exhausted := 0
+	for _, result := range results {
+		if result.Error != "" {
+			failed++
+			continue
+		}
+		succeeded++
+		if result.QuotaExhausted {
+			exhausted++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"total":     len(results),
+		"succeeded": succeeded,
+		"failed":    failed,
+		"exhausted": exhausted,
+		"results":   results,
+	})
+}
+
+func (h *Handler) refreshOneAccount(ctx context.Context, id string, forceCredentials bool) (accountRefreshResult, error) {
+	entry := h.accountMgr.Get(id)
+	if entry == nil {
+		return accountRefreshResult{}, fmt.Errorf("account %q not found", id)
+	}
+
+	resolved, err := h.resolveAccountWithRetry(ctx, id, forceCredentials)
+	if err != nil {
+		return accountRefreshResult{
+			ID:          entry.ID,
+			Name:        entry.Name,
+			AuthSource:  accounts.AuthSource(*entry),
+			UsageStatus: "unavailable",
+			Error:       err.Error(),
+		}, err
+	}
+	h.accountMgr.MarkSuccess(id)
+
+	result := accountRefreshResult{
+		ID:         resolved.Account.ID,
+		Name:       resolved.Account.Name,
+		AuthSource: resolved.AuthSource,
+		HasAPIKey:  resolved.APIKey != "",
+	}
+
+	usageStatus, quotaExhausted, usageErr := h.refreshResolvedAccountUsage(ctx, id, resolved)
+	result.UsageStatus = usageStatus
+	result.QuotaExhausted = quotaExhausted
+	if usageErr != nil {
+		result.Error = usageErr.Error()
+		if forceCredentials {
+			result.Error = ""
+			return result, nil
+		}
+		return result, usageErr
+	}
+
+	return result, nil
+}
+
+func (h *Handler) resolveAccountWithRetry(ctx context.Context, id string, forceCredentials bool) (*accounts.Resolved, error) {
+	resolve := func() (*accounts.Resolved, error) {
+		if forceCredentials {
+			return h.accountMgr.ResolveStandalone(ctx, id)
+		}
+		return h.accountMgr.ResolveForRequest(ctx, id)
+	}
+
+	resolved, err := resolve()
+	if err == nil || ctx.Err() != nil {
+		return resolved, err
+	}
+
+	log.Printf("[Management] Account '%s' refresh failed, retrying once: %v", id, err)
+	timer := time.NewTimer(accountRefreshRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+
+	return resolve()
+}
+
+func (h *Handler) refreshResolvedAccountUsage(ctx context.Context, id string, resolved *accounts.Resolved) (string, bool, error) {
+	if resolved == nil || resolved.APIKey == "" {
+		return "unknown", false, nil
+	}
+
+	proxyURL := strings.TrimSpace(resolved.Account.Proxy)
+	if _, err := h.balancer.EnsureStandaloneForRoute(resolved.APIServer, proxyURL, resolved.APIKey); err != nil && err != balancer.ErrNoStandaloneTemplate {
+		log.Printf("[Management] Standalone worker route ensure failed for account '%s': %v", resolved.Account.Name, err)
+	}
+	probe := h.balancer.ProbeWorker(id, resolved.APIServer, proxyURL)
+	if probe == nil || probe.Client == nil {
+		err := fmt.Errorf("no healthy worker available for usage refresh")
+		h.accountMgr.MarkUsageUnavailable(id, err.Error())
+		return "unavailable", false, err
+	}
+
+	fetch := func() (*accounts.UsageSnapshot, error) {
+		status, err := probe.Client.GetUserStatus(ctx, resolved.APIKey, probe.Version)
+		if err != nil {
+			return nil, err
+		}
+		h.accountMgr.SyncAllowedModels(id, status.AllowedModels)
+		snapshot := accounts.UsageFromUserStatus(status)
+		return &snapshot, nil
+	}
+
+	snapshot, err := fetch()
+	if err != nil && ctx.Err() == nil {
+		log.Printf("[Management] Account '%s' usage refresh failed, retrying once: %v", resolved.Account.Name, err)
+		timer := time.NewTimer(accountRefreshRetryDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-timer.C:
+			snapshot, err = fetch()
+		}
+	}
+	if err != nil {
+		h.accountMgr.MarkUsageUnavailable(id, err.Error())
+		log.Printf("[Management] Account '%s' usage refresh failed: %v", resolved.Account.Name, err)
+		return "unavailable", false, err
+	}
+
+	h.accountMgr.UpdateUsage(id, *snapshot, accounts.QuotaRetryCooldown)
+	if snapshot.QuotaExhausted {
+		return "exhausted", true, nil
+	}
+	return "ok", false, nil
+}
+
+func (h *Handler) startBackgroundAccountRefresh() {
+	go func() {
+		log.Printf("[Management] Background account quota refresh started (delay=%s interval=%s)", accountBackgroundRefreshDelay, accountBackgroundRefreshPeriod)
+
+		timer := time.NewTimer(accountBackgroundRefreshDelay)
+		defer timer.Stop()
+
+		ticker := time.NewTicker(accountBackgroundRefreshPeriod)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-h.refreshCtx.Done():
+				log.Printf("[Management] Background account quota refresh stopped")
+				return
+			case <-timer.C:
+				h.refreshDueAccounts()
+			case <-ticker.C:
+				h.refreshDueAccounts()
+			}
+		}
+	}()
+}
+
+func (h *Handler) refreshDueAccounts() {
+	if h == nil || h.accountMgr == nil {
+		return
+	}
+
+	due := make([]config.AccountConfig, 0, len(h.config.Accounts))
+	for _, entry := range h.config.Accounts {
+		if strings.TrimSpace(entry.ID) == "" || strings.EqualFold(strings.TrimSpace(entry.Status), "disabled") {
+			continue
+		}
+		if h.accountMgr.ShouldRefreshUsage(entry.ID, accounts.UsageRefreshTTL) {
+			due = append(due, entry)
+		}
+	}
+	if len(due) == 0 {
+		return
+	}
+
+	results := h.refreshAccountsBatch(h.refreshCtx, due)
+	succeeded := 0
+	failed := 0
+	exhausted := 0
+	for _, result := range results {
+		if result.Error != "" {
+			failed++
+			continue
+		}
+		succeeded++
+		if result.QuotaExhausted {
+			exhausted++
+		}
+	}
+
+	log.Printf("[Management] Background account quota refresh complete: total=%d success=%d failed=%d exhausted=%d", len(results), succeeded, failed, exhausted)
+}
+
+func (h *Handler) refreshAccountsBatch(parent context.Context, entries []config.AccountConfig) []accountRefreshResult {
+	results := make([]accountRefreshResult, len(entries))
+	sem := make(chan struct{}, accountBatchRefreshConcurrency)
+	var wg sync.WaitGroup
+
+	for i, entry := range entries {
+		i := i
+		entry := entry
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			ctx, cancel := context.WithTimeout(parent, accountRefreshTimeout)
+			defer cancel()
+
+			result, err := h.refreshOneAccount(ctx, entry.ID, false)
+			if err != nil {
+				results[i] = accountRefreshResult{
+					ID:          entry.ID,
+					Name:        entry.Name,
+					AuthSource:  accounts.AuthSource(entry),
+					UsageStatus: "unavailable",
+					Error:       err.Error(),
+				}
+				return
+			}
+			results[i] = result
+		}()
+	}
+
+	wg.Wait()
+	return results
+}
+
+// ============================================================================
 // Instance management
 // ============================================================================
 
@@ -111,16 +558,26 @@ func (h *Handler) listInstances(w http.ResponseWriter, r *http.Request) {
 	result := []map[string]interface{}{}
 	for _, inst := range instances {
 		instType := "unknown"
-		for _, cfg := range h.config.Instances {
-			if cfg.Name == inst.Name {
-				instType = cfg.Type
-				break
+		authSource := ""
+		email := ""
+		accountID := ""
+		accountName := ""
+		if cfg := getInstanceConfig(inst.Name, h.config); cfg != nil {
+			instType = cfg.Type
+			authSource = authSourceForConfig(cfg, h.accountMgr)
+			accountID = cfg.AccountID
+			if account := getAccountConfig(cfg.AccountID, h.config); account != nil {
+				accountName = account.Name
+				email = account.Email
 			}
 		}
 
 		result = append(result, map[string]interface{}{
 			"name":                 inst.Name,
 			"type":                 instType,
+			"auth_source":          authSource,
+			"account_id":           accountID,
+			"account_name":         accountName,
 			"healthy":              inst.Healthy,
 			"active_connections":   inst.ActiveConns,
 			"total_requests":       inst.TotalRequests,
@@ -129,7 +586,8 @@ func (h *Handler) listInstances(w http.ResponseWriter, r *http.Request) {
 			"last_error":           inst.LastError,
 			"host":                 inst.Host,
 			"port":                 inst.Port,
-			"email":                getEmailForInstance(inst.Name, h.config),
+			"proxy":                inst.ProxyDisplay(),
+			"email":                email,
 		})
 	}
 
@@ -145,9 +603,9 @@ type InstanceCreate struct {
 	GRPCPort   int    `json:"grpc_port"`
 	CSRFToken  string `json:"csrf_token"`
 	APIKey     string `json:"api_key"`
+	Proxy      string `json:"proxy"`
 	Weight     int    `json:"weight"`
-	Email      string `json:"email"`
-	Password   string `json:"password"`
+	AccountID  string `json:"account_id"`
 	BinaryPath string `json:"binary_path"`
 	ServerPort int    `json:"server_port"`
 }
@@ -167,7 +625,6 @@ func (h *Handler) addInstance(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	// Create config entry
 	instCfg := config.InstanceConfig{
 		Name:         body.Name,
@@ -176,9 +633,9 @@ func (h *Handler) addInstance(w http.ResponseWriter, r *http.Request) {
 		GRPCPort:     body.GRPCPort,
 		CSRFToken:    body.CSRFToken,
 		APIKey:       body.APIKey,
+		Proxy:        strings.TrimSpace(body.Proxy),
 		Weight:       body.Weight,
-		Email:        body.Email,
-		Password:     body.Password,
+		AccountID:    strings.TrimSpace(body.AccountID),
 		BinaryPath:   body.BinaryPath,
 		ServerPort:   body.ServerPort,
 		AutoDiscover: body.Type == "local",
@@ -278,6 +735,16 @@ func (h *Handler) restartInstance(w http.ResponseWriter, r *http.Request, name s
 	inst := h.balancer.GetInstanceByName(name)
 	if inst == nil {
 		http.Error(w, fmt.Sprintf("Instance '%s' not found", name), http.StatusNotFound)
+		return
+	}
+
+	if inst.Type == "local" {
+		if err := h.balancer.RefreshLocalInstance(inst); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to refresh local instance: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "name": name, "healthy": true})
 		return
 	}
 
@@ -517,6 +984,7 @@ func (h *Handler) getConfig(w http.ResponseWriter, r *http.Request) {
 			"audit": h.config.Logging.Audit,
 		},
 		"instance_count": len(h.config.Instances),
+		"account_count":  len(h.config.Accounts),
 		"api_key_count":  len(h.config.APIKeys),
 	})
 }
@@ -605,6 +1073,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"total_requests":     totalReq,
 		"active_connections": totalConns,
 		"instance_count":     len(instances),
+		"account_count":      len(h.config.Accounts),
 		"healthy_count":      healthyCount,
 		"model_count":        len(core.GetSupportedModels()),
 		"config_path":        h.configPath,
@@ -630,9 +1099,12 @@ type RequestRecord struct {
 	TimeStr          string `json:"time_str"`
 	Model            string `json:"model"`
 	Instance         string `json:"instance"`
+	Account          string `json:"account"`
 	Stream           bool   `json:"stream"`
 	Status           string `json:"status"`
 	DurationMs       int    `json:"duration_ms"`
+	Turns            int    `json:"turns"`
+	PromptChars      int    `json:"prompt_chars"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
 	TotalTokens      int    `json:"total_tokens"`
@@ -641,10 +1113,10 @@ type RequestRecord struct {
 
 // RecordRequest logs a request to history.
 func (h *Handler) RecordRequest(
-	model, instance string,
+	model, instance, account string,
 	stream bool,
 	status string,
-	durationMs, promptTokens, completionTokens, totalTokens int,
+	durationMs, turns, promptChars, promptTokens, completionTokens, totalTokens int,
 	err string,
 ) {
 	rec := RequestRecord{
@@ -653,9 +1125,12 @@ func (h *Handler) RecordRequest(
 		TimeStr:          time.Now().Format("2006-01-02 15:04:05"),
 		Model:            model,
 		Instance:         instance,
+		Account:          account,
 		Stream:           stream,
 		Status:           status,
 		DurationMs:       durationMs,
+		Turns:            turns,
+		PromptChars:      promptChars,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      totalTokens,
@@ -827,11 +1302,41 @@ func (h *Handler) resolveKeyID(id string) string {
 	return ""
 }
 
-func getEmailForInstance(name string, cfg *config.Config) string {
-	for _, inst := range cfg.Instances {
-		if inst.Name == name {
-			return inst.Email
+func getInstanceConfig(name string, cfg *config.Config) *config.InstanceConfig {
+	for i := range cfg.Instances {
+		if cfg.Instances[i].Name == name {
+			return &cfg.Instances[i]
 		}
+	}
+	return nil
+}
+
+func getAccountConfig(id string, cfg *config.Config) *config.AccountConfig {
+	if id == "" {
+		return nil
+	}
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			return &cfg.Accounts[i]
+		}
+	}
+	return nil
+}
+
+func authSourceForConfig(cfg *config.InstanceConfig, accountMgr *accounts.Manager) string {
+	if cfg == nil {
+		return ""
+	}
+	if cfg.AccountID != "" && accountMgr != nil {
+		if account := accountMgr.Get(cfg.AccountID); account != nil {
+			return accounts.AuthSource(*account)
+		}
+	}
+	if cfg.Type == "local" || cfg.AutoDiscover {
+		return "auto_discover"
+	}
+	if cfg.APIKey != "" {
+		return "api_key"
 	}
 	return ""
 }

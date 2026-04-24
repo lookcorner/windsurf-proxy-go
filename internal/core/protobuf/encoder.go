@@ -22,6 +22,14 @@ func EncodeVarintField(fieldNumber int, value uint64) []byte {
 	return append(EncodeVarint(tag), EncodeVarint(value)...)
 }
 
+// EncodeBoolField encodes a boolean as a protobuf varint field.
+func EncodeBoolField(fieldNumber int, value bool) []byte {
+	if value {
+		return EncodeVarintField(fieldNumber, 1)
+	}
+	return EncodeVarintField(fieldNumber, 0)
+}
+
 // EncodeBytesField encodes a length-delimited field (wire type 2).
 func EncodeBytesField(fieldNumber int, data []byte) []byte {
 	tag := uint64((fieldNumber << 3) | 2)

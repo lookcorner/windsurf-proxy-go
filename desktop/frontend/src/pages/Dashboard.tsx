@@ -15,19 +15,22 @@ function formatUptime(seconds: number): string {
 
 export default function Dashboard() {
   const stats = useAppStore((s) => s.stats);
+  const accounts = useAppStore((s) => s.accounts);
   const instances = useAppStore((s) => s.instances);
   const logs = useAppStore((s) => s.logs);
   const loadStats = useAppStore((s) => s.loadStats);
+  const loadAccounts = useAppStore((s) => s.loadAccounts);
   const loadInstances = useAppStore((s) => s.loadInstances);
   const setPage = useAppStore((s) => s.setPage);
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     loadStats();
+    loadAccounts();
     loadInstances();
-    const interval = setInterval(() => { loadStats(); loadInstances(); }, 5000);
+    const interval = setInterval(() => { loadStats(); loadAccounts(); loadInstances(); }, 5000);
     return () => clearInterval(interval);
-  }, [loadStats, loadInstances]);
+  }, [loadStats, loadAccounts, loadInstances]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -48,7 +51,7 @@ export default function Dashboard() {
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 32 }}>
           <h1 style={{ fontSize: 24, fontWeight: 600 }}>服务仪表盘</h1>
-          <Button icon={<RefreshCw size={14} />} onClick={() => { loadStats(); loadInstances(); }}>
+          <Button icon={<RefreshCw size={14} />} onClick={() => { loadStats(); loadAccounts(); loadInstances(); }}>
             刷新数据
           </Button>
         </div>
@@ -72,6 +75,10 @@ export default function Dashboard() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <span style={{ fontSize: 12, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>运行时间</span>
             <span style={{ fontSize: 14, fontWeight: 500 }}>{stats ? formatUptime(stats.uptime_seconds) : '--'}</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>账号池</span>
+            <span style={{ fontSize: 14, fontWeight: 500 }}>{stats?.account_count ?? accounts.length}</span>
           </div>
         </div>
 

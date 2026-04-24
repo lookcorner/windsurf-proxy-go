@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"windsurf-proxy-go/internal/redact"
 )
 
 // SSEWriter writes Server-Sent Events to an io.Writer.
@@ -53,7 +55,7 @@ func (s *SSEWriter) WriteDone() error {
 func (s *SSEWriter) WriteError(message string, errType string) error {
 	errResp := ErrorResponse{
 		Error: ErrorDetail{
-			Message: message,
+			Message: redact.SanitizeText(message),
 			Type:    errType,
 		},
 	}
@@ -72,7 +74,7 @@ func StreamChatCompletion(w io.Writer, model string, events <-chan string) error
 
 	// Content chunks
 	for content := range events {
-		chunk := NewStreamChunk(model, DeltaContent{Content: content}, "")
+		chunk := NewStreamChunk(model, DeltaContent{Content: redact.SanitizeText(content)}, "")
 		if err := sse.WriteJSON(chunk); err != nil {
 			return err
 		}

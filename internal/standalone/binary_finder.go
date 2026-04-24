@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,77 @@ func FindFreePort() (int, error) {
 		return 0, fmt.Errorf("unexpected listener address type %T", l.Addr())
 	}
 	return addr.Port, nil
+}
+
+// FindFreePortBlock returns a server port whose adjacent LS and extension
+// ports are currently free. language_server binds server_port, server_port+1,
+// and this proxy binds server_port+100 for the dummy extension server.
+func FindFreePortBlock() (int, error) {
+	var lastErr error
+	for i := 0; i < 50; i++ {
+		port, err := FindFreePort()
+		if err != nil {
+			return 0, err
+		}
+		if port+100 > 65535 {
+			continue
+		}
+		ok := true
+		for _, candidate := range []int{port, port + 1, port + 100} {
+			inUse, checkErr := IsPortInUse(candidate)
+			if checkErr != nil {
+				lastErr = checkErr
+				ok = false
+				break
+			}
+			if inUse {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return port, nil
+		}
+	}
+	if lastErr != nil {
+		return 0, fmt.Errorf("find free port block: %w", lastErr)
+	}
+	return 0, fmt.Errorf("find free port block: no free port block found")
+}
+
+// IsPortInUse reports whether a local TCP port already has a listener.
+func IsPortInUse(port int) (bool, error) {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		return true, nil
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return false, nil
+	}
+	return false, nil
+}
+
+func MaskProxyForLog(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		if at := strings.LastIndex(raw, "@"); at > 0 {
+			return "***@" + raw[at+1:]
+		}
+		return raw
+	}
+	if parsed.User != nil {
+		if username := parsed.User.Username(); username != "" {
+			parsed.User = url.UserPassword(username, "***")
+		} else {
+			parsed.User = url.User("***")
+		}
+	}
+	return parsed.String()
 }
 
 // Binary search paths by platform

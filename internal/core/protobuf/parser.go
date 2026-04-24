@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"windsurf-proxy-go/internal/core"
 )
 
 // CascadeToolCall represents a tool call made by Cascade during a session.
@@ -31,6 +33,28 @@ type CascadeResult struct {
 	ToolResults []CascadeToolResult
 }
 
+// UserStatusSnapshot is the subset of GetUserStatusResponse needed for
+// scheduling and account visibility.
+type UserStatusSnapshot struct {
+	PlanName                    string
+	TeamsTier                   int
+	MonthlyPromptCredits        int
+	MonthlyFlowCredits          int
+	UsedPromptCredits           int64
+	UsedFlowCredits             int64
+	AvailablePromptCredits      int
+	AvailableFlowCredits        int
+	DailyQuotaRemainingPercent  int
+	WeeklyQuotaRemainingPercent int
+	DailyQuotaResetUnix         int64
+	WeeklyQuotaResetUnix        int64
+	HideDailyQuota              bool
+	HideWeeklyQuota             bool
+	MaxPremiumChatMessages      int64
+	QuotaExhausted              bool
+	AllowedModels               []string
+}
+
 // ParseStartCascadeResponse extracts cascade_id (field 1) from StartCascadeResponse.
 func ParseStartCascadeResponse(data []byte) string {
 	fields := ParseFields(data)
@@ -42,6 +66,35 @@ func ParseStartCascadeResponse(data []byte) string {
 		}
 	}
 	return ""
+}
+
+// ParseGetUserStatusResponse extracts plan/quota data from GetUserStatusResponse.
+func ParseGetUserStatusResponse(data []byte) UserStatusSnapshot {
+	result := UserStatusSnapshot{}
+	fields := ParseFields(data)
+
+	if planInfo := GetMessageField(fields, 2); len(planInfo) > 0 {
+		parsePlanInfoFields(ParseFields(planInfo), &result)
+	}
+
+	if userStatus := GetMessageField(fields, 1); len(userStatus) > 0 {
+		userFields := ParseFields(userStatus)
+		if used := int64(GetVarintField(userFields, 28)); used > 0 {
+			result.UsedPromptCredits = used
+		}
+		if used := int64(GetVarintField(userFields, 29)); used > 0 {
+			result.UsedFlowCredits = used
+		}
+		if max := int64(GetVarintField(userFields, 35)); max > 0 {
+			result.MaxPremiumChatMessages = max
+		}
+		if planStatus := GetMessageField(userFields, 13); len(planStatus) > 0 {
+			parsePlanStatusFields(ParseFields(planStatus), &result)
+		}
+	}
+
+	result.QuotaExhausted = userStatusQuotaExhausted(result)
+	return result
 }
 
 // ParseTrajectorySteps parses GetCascadeTrajectoryStepsResponse.
@@ -103,8 +156,9 @@ func ParseTrajectorySteps(data []byte) CascadeResult {
 		stepType := GetVarintField(stepFields, 1)
 		_ = GetVarintField(stepFields, 4) // stepStatus
 
-		// step_type=23 is the "done" step
-		if stepType == 23 {
+		// Some LS versions expose completion as a dedicated done step
+		// (step_type=23), others only toggle the done marker at field 30.
+		if stepType == 23 || HasField(stepFields, 30) {
 			result.Done = true
 		}
 
@@ -133,26 +187,20 @@ func ParseTrajectorySteps(data []byte) CascadeResult {
 			}
 		}
 
-		// Parse field 24 (error)
+		for _, tc := range parseAdditionalStepToolCalls(stepFields) {
+			if !containsToolCall(toolCalls, &tc) {
+				toolCalls = append(toolCalls, tc)
+			}
+		}
+
 		for _, sf := range stepFields {
-			if sf.FieldNumber == 24 && sf.WireType == 2 {
+			if (sf.FieldNumber == 24 || sf.FieldNumber == 31) && sf.WireType == 2 {
 				errData, ok := sf.Value.([]byte)
 				if !ok {
 					continue
 				}
-				errFields := ParseFields(errData)
-				for _, ef := range errFields {
-					if ef.WireType == 2 {
-						if errBytes, ok := ef.Value.([]byte); ok {
-							errText := string(errBytes)
-							if isPrintable(errText) && len(errText) > 0 {
-								if len(errText) > 200 {
-									errText = errText[:200]
-								}
-								errors = append(errors, errText)
-							}
-						}
-					}
+				if errText := extractCascadeErrorText(errData, 0); errText != "" {
+					errors = append(errors, errText)
 				}
 			}
 
@@ -162,27 +210,13 @@ func ParseTrajectorySteps(data []byte) CascadeResult {
 				if !ok {
 					continue
 				}
-				f20Fields := ParseFields(f20Data)
-				for _, pf := range f20Fields {
-					if pf.WireType != 2 {
-						continue
-					}
-					txtBytes, ok := pf.Value.([]byte)
-					if !ok {
-						continue
-					}
-					txt := string(txtBytes)
-
-					if pf.FieldNumber == 1 && strings.TrimSpace(txt) != "" {
-						// f20.f1 = final text response
-						replyParts = append(replyParts, txt)
-					} else if pf.FieldNumber == 3 && strings.TrimSpace(txt) != "" {
-						// f20.f3 = model thinking/reasoning
-						thinkingParts = append(thinkingParts, txt)
-					}
+				replyText, thinkingText := parsePlannerResponseTexts(f20Data)
+				if replyText != "" {
+					replyParts = append(replyParts, replyText)
 				}
-
-				// Parse f20.f7 (tool calls from planner)
+				if thinkingText != "" {
+					thinkingParts = append(thinkingParts, thinkingText)
+				}
 				for _, ptc := range parsePlannerToolCalls(f20Data) {
 					if !containsToolCall(toolCalls, &ptc) {
 						toolCalls = append(toolCalls, ptc)
@@ -218,7 +252,7 @@ func parseToolCallPayload(data []byte) (callID, toolName, arguments string) {
 		}
 		val := string(valBytes)
 
-		if sf.FieldNumber == 1 && (strings.HasPrefix(val, "chatcmpl-tool-") || strings.HasPrefix(val, "functions.")) {
+		if sf.FieldNumber == 1 && strings.TrimSpace(val) != "" {
 			callID = val
 		} else if sf.FieldNumber == 2 {
 			toolName = val
@@ -228,6 +262,178 @@ func parseToolCallPayload(data []byte) (callID, toolName, arguments string) {
 	}
 
 	return callID, toolName, arguments
+}
+
+func parsePlannerResponseTexts(f20Data []byte) (replyText string, thinkingText string) {
+	fields := ParseFields(f20Data)
+	var responseText string
+	var modifiedText string
+	var thinkingParts []string
+	for _, pf := range fields {
+		if pf.WireType != 2 {
+			continue
+		}
+		txtBytes, ok := pf.Value.([]byte)
+		if !ok {
+			continue
+		}
+		txt := string(txtBytes)
+		if strings.TrimSpace(txt) == "" {
+			continue
+		}
+		switch pf.FieldNumber {
+		case 1:
+			responseText = txt
+		case 3:
+			thinkingParts = append(thinkingParts, txt)
+		case 8:
+			modifiedText = txt
+		}
+	}
+	if modifiedText != "" {
+		replyText = modifiedText
+	} else {
+		replyText = responseText
+	}
+	thinkingText = strings.Join(thinkingParts, "")
+	return replyText, thinkingText
+}
+
+func parsePlanInfoFields(fields []ProtoField, result *UserStatusSnapshot) {
+	if result == nil {
+		return
+	}
+	if tier := int(GetVarintField(fields, 1)); tier != 0 {
+		result.TeamsTier = tier
+	}
+	if name := strings.TrimSpace(GetStringField(fields, 2)); name != "" {
+		result.PlanName = name
+	}
+	if max := int64(GetVarintField(fields, 6)); max > 0 {
+		result.MaxPremiumChatMessages = max
+	}
+	if monthly := int(GetVarintField(fields, 12)); monthly > 0 {
+		result.MonthlyPromptCredits = monthly
+	}
+	if monthly := int(GetVarintField(fields, 13)); monthly > 0 {
+		result.MonthlyFlowCredits = monthly
+	}
+	if GetVarintField(fields, 36) != 0 {
+		result.HideDailyQuota = true
+	}
+	if GetVarintField(fields, 37) != 0 {
+		result.HideWeeklyQuota = true
+	}
+	result.AllowedModels = mergeUniqueStrings(result.AllowedModels, parseAllowedModels(fields))
+}
+
+func parsePlanStatusFields(fields []ProtoField, result *UserStatusSnapshot) {
+	if result == nil {
+		return
+	}
+	if planInfo := GetMessageField(fields, 1); len(planInfo) > 0 {
+		parsePlanInfoFields(ParseFields(planInfo), result)
+	}
+	if available := int(GetVarintField(fields, 8)); available > 0 || hasNumericField(fields, 8) {
+		result.AvailablePromptCredits = available
+	}
+	if available := int(GetVarintField(fields, 9)); available > 0 || hasNumericField(fields, 9) {
+		result.AvailableFlowCredits = available
+	}
+	if used := int64(GetVarintField(fields, 6)); used > result.UsedPromptCredits {
+		result.UsedPromptCredits = used
+	}
+	if used := int64(GetVarintField(fields, 5)); used > result.UsedFlowCredits {
+		result.UsedFlowCredits = used
+	}
+	if remaining := int(GetVarintField(fields, 14)); remaining > 0 || hasNumericField(fields, 14) {
+		result.DailyQuotaRemainingPercent = remaining
+	}
+	if remaining := int(GetVarintField(fields, 15)); remaining > 0 || hasNumericField(fields, 15) {
+		result.WeeklyQuotaRemainingPercent = remaining
+	}
+	if reset := int64(GetVarintField(fields, 17)); reset > 0 {
+		result.DailyQuotaResetUnix = reset
+	}
+	if reset := int64(GetVarintField(fields, 18)); reset > 0 {
+		result.WeeklyQuotaResetUnix = reset
+	}
+}
+
+func hasNumericField(fields []ProtoField, fieldNumber int) bool {
+	for _, f := range fields {
+		if f.FieldNumber == fieldNumber && f.WireType == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func userStatusQuotaExhausted(result UserStatusSnapshot) bool {
+	if result.AvailablePromptCredits == 0 && (result.MonthlyPromptCredits > 0 || result.UsedPromptCredits > 0) {
+		return true
+	}
+	if result.AvailableFlowCredits == 0 && (result.MonthlyFlowCredits > 0 || result.UsedFlowCredits > 0) {
+		return true
+	}
+	if !result.HideDailyQuota && result.DailyQuotaRemainingPercent == 0 && result.DailyQuotaResetUnix > 0 {
+		return true
+	}
+	if !result.HideWeeklyQuota && result.WeeklyQuotaRemainingPercent == 0 && result.WeeklyQuotaResetUnix > 0 {
+		return true
+	}
+	return false
+}
+
+func parseAllowedModels(fields []ProtoField) []string {
+	models := make([]string, 0)
+	for _, field := range fields {
+		if field.FieldNumber != 21 || field.WireType != 2 {
+			continue
+		}
+		entry, ok := field.Value.([]byte)
+		if !ok || len(entry) == 0 {
+			continue
+		}
+		configFields := ParseFields(entry)
+		modelOrAlias := GetMessageField(configFields, 1)
+		if len(modelOrAlias) == 0 {
+			continue
+		}
+		modelFields := ParseFields(modelOrAlias)
+		enumValue := GetVarintField(modelFields, 1)
+		if enumValue == 0 {
+			continue
+		}
+		models = mergeUniqueStrings(models, core.ModelNamesForEnum(core.ModelEnum(enumValue)))
+	}
+	return models
+}
+
+func mergeUniqueStrings(current []string, next []string) []string {
+	if len(next) == 0 {
+		return current
+	}
+	seen := make(map[string]bool, len(current)+len(next))
+	out := make([]string, 0, len(current)+len(next))
+	for _, item := range current {
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	for _, item := range next {
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // parseToolCallStep extracts tool call info from a step type=9.
@@ -457,6 +663,131 @@ func parsePlannerToolCalls(f20Data []byte) []CascadeToolCall {
 	}
 
 	return toolCalls
+}
+
+func parseAdditionalStepToolCalls(stepFields []ProtoField) []CascadeToolCall {
+	toolCalls := make([]CascadeToolCall, 0)
+	for _, sf := range stepFields {
+		if sf.WireType != 2 {
+			continue
+		}
+		data, ok := sf.Value.([]byte)
+		if !ok {
+			continue
+		}
+		switch sf.FieldNumber {
+		case 45:
+			if tc := parseCustomToolCall(data); tc != nil {
+				toolCalls = append(toolCalls, *tc)
+			}
+		case 47:
+			fields := ParseFields(data)
+			if call := parseChatToolCall(GetMessageField(fields, 2)); call != nil {
+				toolCalls = append(toolCalls, *call)
+			}
+		case 49:
+			fields := ParseFields(data)
+			if call := parseChatToolCall(GetMessageField(fields, 1)); call != nil {
+				toolCalls = append(toolCalls, *call)
+			}
+		case 50:
+			fields := ParseFields(data)
+			choiceIdx := int(GetVarintField(fields, 2))
+			candidates := make([]CascadeToolCall, 0)
+			for _, f := range fields {
+				if f.FieldNumber != 1 || f.WireType != 2 {
+					continue
+				}
+				if data, ok := f.Value.([]byte); ok {
+					if call := parseChatToolCall(data); call != nil {
+						candidates = append(candidates, *call)
+					}
+				}
+			}
+			if len(candidates) > 0 {
+				if choiceIdx < 0 || choiceIdx >= len(candidates) {
+					choiceIdx = 0
+				}
+				toolCalls = append(toolCalls, candidates[choiceIdx])
+			}
+		}
+	}
+	return toolCalls
+}
+
+func parseCustomToolCall(data []byte) *CascadeToolCall {
+	fields := ParseFields(data)
+	callID := strings.TrimSpace(GetStringField(fields, 1))
+	args := strings.TrimSpace(GetStringField(fields, 2))
+	name := strings.TrimSpace(GetStringField(fields, 4))
+	if name == "" {
+		name = callID
+	}
+	if name == "" {
+		return nil
+	}
+	if callID == "" {
+		callID = "tool-" + uuid.New().String()[:8]
+	}
+	if args == "" {
+		args = "{}"
+	}
+	return &CascadeToolCall{
+		CallID:    callID,
+		Name:      name,
+		Arguments: args,
+	}
+}
+
+func parseChatToolCall(data []byte) *CascadeToolCall {
+	if len(data) == 0 {
+		return nil
+	}
+	fields := ParseFields(data)
+	callID := strings.TrimSpace(GetStringField(fields, 1))
+	name := strings.TrimSpace(GetStringField(fields, 2))
+	args := strings.TrimSpace(GetStringField(fields, 3))
+	if name == "" {
+		return nil
+	}
+	if callID == "" {
+		callID = "tool-" + uuid.New().String()[:8]
+	}
+	if args == "" {
+		args = "{}"
+	}
+	return &CascadeToolCall{
+		CallID:    callID,
+		Name:      name,
+		Arguments: args,
+	}
+}
+
+func extractCascadeErrorText(data []byte, depth int) string {
+	if depth > 4 || len(data) == 0 {
+		return ""
+	}
+	fields := ParseFields(data)
+	for _, f := range fields {
+		if f.WireType != 2 {
+			continue
+		}
+		valBytes, ok := f.Value.([]byte)
+		if !ok || len(valBytes) == 0 {
+			continue
+		}
+		val := strings.TrimSpace(string(valBytes))
+		if val != "" && isPrintable(val) {
+			if len(val) > 200 {
+				return val[:200]
+			}
+			return val
+		}
+		if nested := extractCascadeErrorText(valBytes, depth+1); nested != "" {
+			return nested
+		}
+	}
+	return ""
 }
 
 // ExtractTextFromResponse extracts text from RawGetChatMessageResponse.

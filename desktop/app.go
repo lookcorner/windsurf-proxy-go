@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"windsurf-proxy-go/internal/accounts"
 	"windsurf-proxy-go/internal/api"
 	"windsurf-proxy-go/internal/audit"
 	"windsurf-proxy-go/internal/balancer"
@@ -26,6 +27,7 @@ type App struct {
 	ctx        context.Context
 	server     *http.Server
 	bal        *balancer.LoadBalancer
+	accountMgr *accounts.Manager
 	keyMgr     *keys.Manager
 	cfg        *config.Config
 	apiHandler *api.Handler
@@ -101,18 +103,21 @@ func (a *App) Startup(ctx context.Context) {
 	a.keyMgr = keys.NewManager(cfg.APIKeys)
 	log.Printf("[Desktop] API key auth: %d keys loaded", len(cfg.APIKeys))
 
+	accountMgr := accounts.NewManager(cfg)
+	a.accountMgr = accountMgr
+
 	// Create load balancer
-	a.bal = balancer.New(&cfg.Balancing)
+	a.bal = balancer.New(&cfg.Balancing, accountMgr)
 	a.bal.InitFromConfigs(cfg.Instances)
 	a.bal.StartHealthChecks()
 	log.Printf("[Desktop] Load balancer: %d instances", len(cfg.Instances))
 
-	a.mgmt = management.NewHandler(a.bal, a.keyMgr, a.cfg, "")
+	a.mgmt = management.NewHandler(a.bal, a.keyMgr, accountMgr, a.cfg, "")
 	a.mgmt.SetServerConfigChangedHandler(a.restartServerWithConfig)
 	a.mgmt.SetLoggingChangedHandler(func(_ config.LoggingConfig) {
 		a.applyAuditConfig(filepath.Join(config.GetDataDir(), "logs"))
 	})
-	a.apiHandler = api.NewHandler(a.bal, a.keyMgr, a.cfg, a.mgmt.RecordRequest)
+	a.apiHandler = api.NewHandler(a.bal, accountMgr, a.keyMgr, a.cfg, a.mgmt.RecordRequest)
 
 	// Attach the management handler so log lines start being broadcast
 	// to WebSocket clients (file logging is already running).
@@ -140,9 +145,16 @@ func (a *App) Shutdown(ctx context.Context) {
 		log.Printf("[Desktop] HTTP server stopped")
 	}
 
+	if a.mgmt != nil {
+		a.mgmt.Stop()
+	}
+
 	if a.bal != nil {
 		a.bal.Stop()
 		log.Printf("[Desktop] Load balancer stopped")
+	}
+	if a.accountMgr != nil {
+		a.accountMgr.Stop()
 	}
 
 	a.running = false

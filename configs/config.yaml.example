@@ -8,10 +8,31 @@ api_keys:
     rate_limit: 60
     allowed_models: ["*"]
 
+accounts:
+  - id: "acct_primary"
+    name: "primary-pro"
+    email: "user@example.com"
+    firebase_refresh_token: "refresh-token-here"
+    api_server: "https://server.self-serve.windsurf.com"
+    # Optional per-account outbound proxy. Accounts with the same proxy share
+    # one standalone language_server; different proxies get isolated workers.
+    proxy: "http://user:pass@127.0.0.1:7890"
+    # Optional static model filters. Leave empty to allow all models this
+    # proxy supports; blocked_models always wins over available_models.
+    available_models: ["claude-4.6-opus", "claude-4.6-sonnet"]
+    blocked_models: []
+
 instances:
   - name: "local"
     type: "local"
     auto_discover: true
+    weight: 10
+  - name: "primary-runtime"
+    type: "standalone"
+    # Optional bootstrap account. The standalone worker is shared by all
+    # compatible accounts on the same api_server + proxy route; request-time
+    # routing injects each account's API key.
+    account_id: "acct_primary"
     weight: 10
 
 balancing:

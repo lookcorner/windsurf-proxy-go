@@ -529,14 +529,21 @@ func (c *WindsurfGrpcClient) cascadeProducer(
 					out <- StreamEvent{Type: "error", Data: err.Error()}
 					return
 				}
-				autoContinueCount++
+
 				roundToolCallCount = 0
 				contentStableCount = 0
 				log.Printf("[Cascade] auto-continue native round %d for model=%s after tool-only marker",
-					autoContinueCount, modelUID)
+					autoContinueCount+1, modelUID)
 				err = c.CascadeSend(ctx, cascadeID, CascadeContinuePrompt, modelEnum, modelUID, apiKey, version, systemPrompt)
+				if isCascadeExecutorNotIdle(err) {
+					log.Printf("[Cascade] native auto-continue deferred; executor is still running")
+					time.Sleep(CascadeInitialWait)
+					continue
+				}
 				if err != nil {
 					log.Printf("[Cascade] native auto-continue send failed: %v", err)
+				} else {
+					autoContinueCount++
 				}
 				time.Sleep(CascadeInitialWait)
 				continue

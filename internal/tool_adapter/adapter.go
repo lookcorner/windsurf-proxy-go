@@ -25,7 +25,7 @@ type ToolCallPlan struct {
 }
 
 var (
-	streamActionPattern  = regexp.MustCompile(`"action"\s*:\s*"(final|tool_call)"`)
+	streamActionPattern  = regexp.MustCompile(`"action"\s*:\s*"(final|tool_calls?)"`)
 	streamContentPattern = regexp.MustCompile(`"content"\s*:\s*"`)
 )
 
@@ -87,7 +87,7 @@ func (p *StructuredResponseStreamParser) Feed(delta string) (string, []ToolCall)
 		}
 	}
 
-	if p.action == "tool_call" && !p.emittedCalls {
+	if (p.action == "tool_call" || p.action == "tool_calls") && !p.emittedCalls {
 		if jsonText, _, ok := extractJSONObject(p.raw, p.jsonStart); ok {
 			if plan, ok := decodeStructuredToolPlan(jsonText); ok && plan.Action == "tool_call" && len(plan.ToolCalls) > 0 {
 				p.done = true
@@ -521,7 +521,7 @@ func decodeStructuredToolPlan(jsonText string) (ToolCallPlan, bool) {
 			ToolCalls: []ToolCall{},
 			Content:   content,
 		}, true
-	case "tool_call":
+	case "tool_call", "tool_calls":
 		tcArr, ok := parsed["tool_calls"].([]interface{})
 		if !ok {
 			return ToolCallPlan{}, false

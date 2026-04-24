@@ -161,3 +161,25 @@ func TestBuildToolPromptInjectsToolsWithoutSystemMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestStructuredResponseStreamParserAcceptsPluralToolCallsAction(t *testing.T) {
+	parser := NewStructuredResponseStreamParser()
+	text, calls := parser.Feed(`{"action":"tool_calls","tool_calls":[{"name":"Read"`)
+	if text != "" || len(calls) != 0 {
+		t.Fatalf("partial plural action text=%q calls=%d, want empty/0", text, len(calls))
+	}
+	text, calls = parser.Feed(`,"arguments":{"file_path":"README.md"}}]}`)
+	if text != "" {
+		t.Fatalf("plural action text = %q, want empty", text)
+	}
+	if len(calls) != 1 || calls[0].Name != "Read" {
+		t.Fatalf("plural action calls = %#v", calls)
+	}
+}
+
+func TestParseToolResponseAcceptsPluralToolCallsAction(t *testing.T) {
+	plan := ParseToolResponse(`{"action":"tool_calls","tool_calls":[{"name":"Bash","arguments":{"command":"ls"}}]}`)
+	if plan.Action != "tool_call" || len(plan.ToolCalls) != 1 || plan.ToolCalls[0].Name != "Bash" {
+		t.Fatalf("plan = %#v", plan)
+	}
+}

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-
-	"windsurf-proxy-go/internal/core/protobuf"
 )
 
 type anthropicRequestMetricSummary struct {
@@ -76,7 +74,7 @@ func convertAnthropicRequest(req *AnthropicMessagesRequest) (
 	err error,
 ) {
 	if isClaudeCodeRequest(req) {
-		return compactClaudeCodeRequest(req), nil, nil
+		return compactClaudeCodeRequest(req), filterClaudeCodeTools(req.Tools), nil
 	}
 
 	messages = make([]map[string]interface{}, 0, len(req.Messages)+1)
@@ -250,7 +248,7 @@ func compactClaudeCodeRequest(req *AnthropicMessagesRequest) []map[string]interf
 	}
 	joinedMessages := strings.Join(messageTexts, "\n\n")
 
-	parts := make([]string, 0, 6)
+	parts := make([]string, 0, 5)
 	if cwd := firstRegexpGroup(claudeCodeCWDPattern, system+"\n"+joinedMessages); cwd != "" {
 		parts = append(parts, "Working directory: "+cwd)
 	}
@@ -260,20 +258,114 @@ func compactClaudeCodeRequest(req *AnthropicMessagesRequest) []map[string]interf
 	if instruction := extractClaudeCodeUserInstructions(system + "\n" + joinedMessages); instruction != "" {
 		parts = append(parts, "Relevant user/project instructions:\n"+instruction)
 	}
-	if task := extractClaudeCodeUserTask(req); task != "" {
-		parts = append(parts, "User request:\n"+task)
-	}
 	if len(parts) == 0 {
-		parts = append(parts, joinedMessages)
+		parts = append(parts, "Claude Code request context compacted by proxy.")
 	}
 
-	return []map[string]interface{}{{
+	messages := []map[string]interface{}{{
 		"role":    "system",
-		"content": protobuf.NativeCascadeToolsMarker,
-	}, {
-		"role":    "user",
 		"content": strings.Join(parts, "\n\n"),
 	}}
+	messages = append(messages, compactClaudeCodeConversation(req.Messages)...)
+	return messages
+}
+
+func compactClaudeCodeConversation(input []AnthropicMessage) []map[string]interface{} {
+	messages := make([]map[string]interface{}, 0, len(input))
+	for _, msg := range input {
+		if text, ok := decodeMaybeString(msg.Content); ok {
+			if text = stripClaudeCodeReminders(text); strings.TrimSpace(text) != "" {
+				messages = append(messages, map[string]interface{}{"role": msg.Role, "content": text})
+			}
+			continue
+		}
+
+		var blocks []AnthropicBlock
+		if len(msg.Content) == 0 || json.Unmarshal(msg.Content, &blocks) != nil {
+			continue
+		}
+		var textBuf strings.Builder
+		toolCalls := make([]map[string]interface{}, 0)
+		flushText := func() {
+			text := strings.TrimSpace(stripClaudeCodeReminders(textBuf.String()))
+			if text != "" {
+				messages = append(messages, map[string]interface{}{"role": msg.Role, "content": text})
+			}
+			textBuf.Reset()
+		}
+
+		for _, block := range blocks {
+			switch block.Type {
+			case "text", "thinking":
+				text := block.Text
+				if text == "" {
+					text = block.Thinking
+				}
+				if strings.TrimSpace(text) != "" {
+					if textBuf.Len() > 0 {
+						textBuf.WriteString("\n")
+					}
+					textBuf.WriteString(text)
+				}
+			case "tool_use":
+				args := string(block.Input)
+				if args == "" || args == "null" {
+					args = "{}"
+				}
+				toolCalls = append(toolCalls, map[string]interface{}{
+					"id": block.ID, "type": "function",
+					"function": map[string]interface{}{"name": block.Name, "arguments": args},
+				})
+			case "tool_result":
+				flushText()
+				resultText := flattenToolResultContent(block.Content)
+				if block.IsError && resultText != "" {
+					resultText = "[error] " + resultText
+				}
+				messages = append(messages, map[string]interface{}{
+					"role": "tool", "tool_call_id": block.ToolUseID, "content": resultText,
+				})
+			}
+		}
+		flushText()
+		if len(toolCalls) > 0 {
+			messages = append(messages, map[string]interface{}{"role": "assistant", "content": "", "tool_calls": toolCalls})
+		}
+	}
+	return messages
+}
+
+func stripClaudeCodeReminders(text string) string {
+	blocks := splitSystemReminderBlocks(text)
+	kept := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if block == "" || strings.HasPrefix(block, "<system-reminder>") {
+			continue
+		}
+		kept = append(kept, block)
+	}
+	return strings.Join(kept, "\n\n")
+}
+
+func filterClaudeCodeTools(input []AnthropicTool) []map[string]interface{} {
+	allowed := map[string]bool{
+		"Bash": true, "Read": true, "Write": true, "Edit": true, "MultiEdit": true,
+		"Glob": true, "Grep": true, "LS": true,
+	}
+	tools := make([]map[string]interface{}, 0, len(allowed))
+	for _, t := range input {
+		if !allowed[t.Name] {
+			continue
+		}
+		tools = append(tools, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": t.Name, "description": t.Description, "parameters": t.InputSchema,
+			},
+		})
+	}
+	return tools
 }
 
 func extractAnthropicMessageText(msg AnthropicMessage) string {

@@ -109,25 +109,27 @@ func TestConvertAnthropicRequestPreservesClaudeCodeSystemPrompt(t *testing.T) {
 		t.Fatalf("convertAnthropicRequest: %v", err)
 	}
 	if len(messages) != 2 {
-		t.Fatalf("expected compacted message, got %d", len(messages))
+		t.Fatalf("expected compacted messages, got %d", len(messages))
 	}
 	if role, _ := messages[0]["role"].(string); role != "system" {
-		t.Fatalf("native tools marker role = %q, want system", role)
+		t.Fatalf("compacted context role = %q, want system", role)
 	}
 	if role, _ := messages[1]["role"].(string); role != "user" {
 		t.Fatalf("compacted role = %q, want user", role)
 	}
-	content, _ := messages[1]["content"].(string)
+	contextContent, _ := messages[0]["content"].(string)
 	for _, want := range []string{
 		"Working directory: /Users/rentong/Downloads/dnmp/goproject/windsurf-proxy-go",
 		"Relevant user/project instructions:",
 		"Project override: always answer in Chinese.",
-		"User request:",
-		"hello",
 	} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("expected compacted prompt to contain %q, got %q", want, content)
+		if !strings.Contains(contextContent, want) {
+			t.Fatalf("expected compacted context to contain %q, got %q", want, contextContent)
 		}
+	}
+	content, _ := messages[1]["content"].(string)
+	if content != "hello" {
+		t.Fatalf("compacted user content = %q, want hello", content)
 	}
 	for _, unwanted := range []string{
 		"x-anthropic-billing-header",
@@ -167,17 +169,20 @@ func TestConvertAnthropicRequestCompactsClaudeCodeReminders(t *testing.T) {
 		t.Fatalf("convertAnthropicRequest: %v", err)
 	}
 	if len(tools) != 0 {
-		t.Fatalf("tools len = %d, want 0", len(tools))
+		t.Fatalf("tools len = %d, want 0 for request without tool definitions", len(tools))
 	}
-	content, _ := messages[1]["content"].(string)
+	contextContent, _ := messages[0]["content"].(string)
 	for _, want := range []string{
 		"Working directory: /repo/project",
 		"Opened file: /repo/project/internal/reuse/reuse.go",
-		"User request:\n阅读项目代码",
 	} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("compacted prompt missing %q:\n%s", want, content)
+		if !strings.Contains(contextContent, want) {
+			t.Fatalf("compacted context missing %q:\n%s", want, contextContent)
 		}
+	}
+	content, _ := messages[1]["content"].(string)
+	if content != "阅读项目代码" {
+		t.Fatalf("compacted user content = %q, want 阅读项目代码", content)
 	}
 	if strings.Contains(content, "skills noise") || strings.Contains(content, "Huge boilerplate") {
 		t.Fatalf("compacted prompt contains noise:\n%s", content)
@@ -209,5 +214,36 @@ func TestConvertAnthropicRequestPreservesCustomSystemString(t *testing.T) {
 	system, _ := messages[0]["content"].(string)
 	if !strings.Contains(system, "Custom system prompt") {
 		t.Fatalf("system context = %q, want to contain %q", system, "Custom system prompt")
+	}
+}
+
+func TestConvertClaudeCodeRequestFiltersToolsForCallerExecution(t *testing.T) {
+	req := &AnthropicMessagesRequest{
+		System:   json.RawMessage(`[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude. Current working directory: /repo/project"}]`),
+		Messages: []AnthropicMessage{{Role: "user", Content: json.RawMessage(`"写 README"`)}},
+		Tools: []AnthropicTool{
+			{Name: "Read", Description: "read", InputSchema: map[string]interface{}{"type": "object"}},
+			{Name: "Bash", Description: "bash", InputSchema: map[string]interface{}{"type": "object"}},
+			{Name: "Skill", Description: "noise", InputSchema: map[string]interface{}{"type": "object"}},
+		},
+	}
+
+	messages, tools, err := convertAnthropicRequest(req)
+	if err != nil {
+		t.Fatalf("convertAnthropicRequest: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages len = %d, want 2", len(messages))
+	}
+	if len(tools) != 2 {
+		t.Fatalf("tools len = %d, want 2", len(tools))
+	}
+	names := map[string]bool{}
+	for _, tool := range tools {
+		fn := tool["function"].(map[string]interface{})
+		names[fn["name"].(string)] = true
+	}
+	if !names["Read"] || !names["Bash"] || names["Skill"] {
+		t.Fatalf("filtered tool names = %#v", names)
 	}
 }

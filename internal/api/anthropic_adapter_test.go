@@ -217,14 +217,15 @@ func TestConvertAnthropicRequestPreservesCustomSystemString(t *testing.T) {
 	}
 }
 
-func TestConvertClaudeCodeRequestFiltersToolsForCallerExecution(t *testing.T) {
+func TestConvertClaudeCodeRequestPassesClientToolsForCallerExecution(t *testing.T) {
 	req := &AnthropicMessagesRequest{
 		System:   json.RawMessage(`[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude. Current working directory: /repo/project"}]`),
 		Messages: []AnthropicMessage{{Role: "user", Content: json.RawMessage(`"写 README"`)}},
 		Tools: []AnthropicTool{
 			{Name: "Read", Description: "read", InputSchema: map[string]interface{}{"type": "object"}},
 			{Name: "Bash", Description: "bash", InputSchema: map[string]interface{}{"type": "object"}},
-			{Name: "Skill", Description: "noise", InputSchema: map[string]interface{}{"type": "object"}},
+			{Name: "Task", Description: "delegate", InputSchema: map[string]interface{}{"type": "object"}},
+			{Name: "Skill", Description: "load skill", InputSchema: map[string]interface{}{"type": "object"}},
 		},
 	}
 
@@ -235,15 +236,17 @@ func TestConvertClaudeCodeRequestFiltersToolsForCallerExecution(t *testing.T) {
 	if len(messages) != 2 {
 		t.Fatalf("messages len = %d, want 2", len(messages))
 	}
-	if len(tools) != 2 {
-		t.Fatalf("tools len = %d, want 2", len(tools))
+	if len(tools) != 4 {
+		t.Fatalf("tools len = %d, want 4", len(tools))
 	}
 	names := map[string]bool{}
 	for _, tool := range tools {
 		fn := tool["function"].(map[string]interface{})
 		names[fn["name"].(string)] = true
 	}
-	if !names["Read"] || !names["Bash"] || names["Skill"] {
-		t.Fatalf("filtered tool names = %#v", names)
+	for _, want := range []string{"Read", "Bash", "Task", "Skill"} {
+		if !names[want] {
+			t.Fatalf("tool %q missing from passed-through names %#v", want, names)
+		}
 	}
 }

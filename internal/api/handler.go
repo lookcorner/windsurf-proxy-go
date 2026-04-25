@@ -972,13 +972,9 @@ func convertMessages(msgs []map[string]interface{}) []map[string]string {
 			}
 			content = textParts.String()
 		}
-		if toolCalls, ok := m["tool_calls"].([]interface{}); ok && len(toolCalls) > 0 {
+		if toolCalls := messageToolCallMaps(m["tool_calls"]); len(toolCalls) > 0 {
 			toolLines := make([]string, 0, len(toolCalls))
-			for _, rawCall := range toolCalls {
-				call, ok := rawCall.(map[string]interface{})
-				if !ok {
-					continue
-				}
+			for _, call := range toolCalls {
 				function, _ := call["function"].(map[string]interface{})
 				name, _ := function["name"].(string)
 				args, _ := function["arguments"].(string)
@@ -1011,6 +1007,23 @@ func convertMessages(msgs []map[string]interface{}) []map[string]string {
 		})
 	}
 	return result
+}
+
+func messageToolCallMaps(raw interface{}) []map[string]interface{} {
+	switch toolCalls := raw.(type) {
+	case []map[string]interface{}:
+		return toolCalls
+	case []interface{}:
+		result := make([]map[string]interface{}, 0, len(toolCalls))
+		for _, rawCall := range toolCalls {
+			if call, ok := rawCall.(map[string]interface{}); ok {
+				result = append(result, call)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
 }
 
 // describeOpenAIImagePart renders an OpenAI-style image_url content part

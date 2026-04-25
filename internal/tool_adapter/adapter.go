@@ -265,35 +265,29 @@ func BuildToolPrompt(
 			// Convert tool result to user message
 			name, _ := msg["name"].(string)
 			toolCallID, _ := msg["tool_call_id"].(string)
-			truncated := content
-			if len(truncated) > 2000 {
-				truncated = truncated[:2000]
-			}
 			result = append(result, map[string]string{
 				"role":    "user",
-				"content": fmt.Sprintf("[Tool result for %s (id=%s)]: %s", name, toolCallID, truncated),
+				"content": fmt.Sprintf("[Tool result for %s (id=%s)]: %s", name, toolCallID, content),
 			})
 		} else if role == "assistant" {
 			// Check for tool_calls
-			if toolCalls, ok := msg["tool_calls"].([]interface{}); ok && len(toolCalls) > 0 {
+			if toolCalls := normalizeToolCallMaps(msg["tool_calls"]); len(toolCalls) > 0 {
 				// Convert assistant tool_calls to text
 				calls := []map[string]interface{}{}
-				for _, tc := range toolCalls {
-					if tcMap, ok := tc.(map[string]interface{}); ok {
-						funcData, _ := tcMap["function"].(map[string]interface{})
-						name, _ := funcData["name"].(string)
-						argsStr, _ := funcData["arguments"].(string)
-						var args interface{}
-						if argsStr != "" {
-							json.Unmarshal([]byte(argsStr), &args)
-						} else {
-							args = map[string]interface{}{}
-						}
-						calls = append(calls, map[string]interface{}{
-							"name":      name,
-							"arguments": args,
-						})
+				for _, tcMap := range toolCalls {
+					funcData, _ := tcMap["function"].(map[string]interface{})
+					name, _ := funcData["name"].(string)
+					argsStr, _ := funcData["arguments"].(string)
+					var args interface{}
+					if argsStr != "" {
+						json.Unmarshal([]byte(argsStr), &args)
+					} else {
+						args = map[string]interface{}{}
 					}
+					calls = append(calls, map[string]interface{}{
+						"name":      name,
+						"arguments": args,
+					})
 				}
 				tcText, _ := json.Marshal(map[string]interface{}{
 					"action":     "tool_call",
@@ -329,6 +323,23 @@ func BuildToolPrompt(
 	}
 
 	return result
+}
+
+func normalizeToolCallMaps(raw interface{}) []map[string]interface{} {
+	switch toolCalls := raw.(type) {
+	case []map[string]interface{}:
+		return toolCalls
+	case []interface{}:
+		result := make([]map[string]interface{}, 0, len(toolCalls))
+		for _, rawCall := range toolCalls {
+			if call, ok := rawCall.(map[string]interface{}); ok {
+				result = append(result, call)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
 }
 
 func hasSystemMessage(messages []map[string]string) bool {

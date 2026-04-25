@@ -349,13 +349,9 @@ func stripClaudeCodeReminders(text string) string {
 }
 
 func filterClaudeCodeTools(input []AnthropicTool) []map[string]interface{} {
-	allowed := map[string]bool{
-		"Bash": true, "Read": true, "Write": true, "Edit": true, "MultiEdit": true,
-		"Glob": true, "Grep": true, "LS": true,
-	}
-	tools := make([]map[string]interface{}, 0, len(allowed))
+	tools := make([]map[string]interface{}, 0, len(input))
 	for _, t := range input {
-		if !allowed[t.Name] {
+		if strings.TrimSpace(t.Name) == "" {
 			continue
 		}
 		tools = append(tools, map[string]interface{}{

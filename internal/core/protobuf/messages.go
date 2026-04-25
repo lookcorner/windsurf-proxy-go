@@ -177,7 +177,7 @@ func buildCascadePlannerConfig(modelEnum int, modelUID string, systemPrompt stri
 	}
 
 	buf = append(buf, EncodeVarintField(6, cascadeMaxOutputTokens)...)
-	if !hasStructuredToolProtocol(systemPrompt) && !useNativeCascadeTools(systemPrompt) {
+	if !useNativeCascadeTools(systemPrompt) {
 		buf = append(buf, EncodeMessageField(11, buildSectionOverride(""))...)
 	}
 
@@ -198,7 +198,7 @@ func buildCascadeConversationalPlannerConfig(systemPrompt string) []byte {
 			buf = append(buf, EncodeMessageField(12, buildSectionOverride(text))...)
 		}
 		buf = append(buf, EncodeMessageField(13, buildSectionOverride(
-			"Use the caller-provided tool protocol when it is relevant. Do not claim that tools are unavailable if the instructions define them.",
+			"Use the caller-provided tool protocol when it is relevant. Do not use Cascade-native filesystem, terminal, or code-editing tools directly; emit the requested JSON tool_call so the caller can execute it. Do not claim that tools are unavailable if the instructions define them.",
 		))...)
 		return buf
 	}

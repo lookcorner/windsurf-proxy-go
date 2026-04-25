@@ -162,6 +162,53 @@ func TestBuildToolPromptInjectsToolsWithoutSystemMessage(t *testing.T) {
 	}
 }
 
+func TestBuildToolPromptPreservesClaudeCodeToolHistoryAndFullResults(t *testing.T) {
+	longResult := strings.Repeat("0123456789", 260) + "END"
+	tools := []map[string]interface{}{
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "Read",
+				"description": "Read a local file.",
+				"parameters":  map[string]interface{}{"type": "object"},
+			},
+		},
+	}
+	messages := []map[string]interface{}{
+		{"role": "system", "content": "System prompt"},
+		{
+			"role":    "assistant",
+			"content": "",
+			"tool_calls": []map[string]interface{}{
+				{
+					"id":   "toolu_1",
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      "Read",
+						"arguments": `{"file_path":"README.md"}`,
+					},
+				},
+			},
+		},
+		{"role": "tool", "tool_call_id": "toolu_1", "content": longResult},
+	}
+
+	got := BuildToolPrompt(tools, messages, nil)
+	if len(got) != 3 {
+		t.Fatalf("BuildToolPrompt returned %d messages, want 3", len(got))
+	}
+	assistant := got[1]["content"]
+	for _, want := range []string{`"action":"tool_call"`, `"name":"Read"`, `"file_path":"README.md"`} {
+		if !strings.Contains(assistant, want) {
+			t.Fatalf("assistant tool history missing %q:\n%s", want, assistant)
+		}
+	}
+	toolResult := got[2]["content"]
+	if !strings.Contains(toolResult, longResult) {
+		t.Fatalf("tool result was truncated or changed, len=%d", len(toolResult))
+	}
+}
+
 func TestStructuredResponseStreamParserAcceptsPluralToolCallsAction(t *testing.T) {
 	parser := NewStructuredResponseStreamParser()
 	text, calls := parser.Feed(`{"action":"tool_calls","tool_calls":[{"name":"Read"`)

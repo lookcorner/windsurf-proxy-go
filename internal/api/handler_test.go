@@ -92,6 +92,31 @@ func TestConvertMessagesPreservesAssistantToolCallHistoryAndToolCallID(t *testin
 	}
 }
 
+func TestConvertMessagesPreservesTypedToolCallSlices(t *testing.T) {
+	msgs := []map[string]interface{}{
+		{
+			"role":    "assistant",
+			"content": "",
+			"tool_calls": []map[string]interface{}{
+				{
+					"function": map[string]interface{}{
+						"name":      "Read",
+						"arguments": `{"file_path":"README.md"}`,
+					},
+				},
+			},
+		},
+	}
+
+	got := convertMessages(msgs)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 converted message, got %d", len(got))
+	}
+	if got[0]["content"] != `[called tool Read with {"file_path":"README.md"}]` {
+		t.Fatalf("assistant content = %q", got[0]["content"])
+	}
+}
+
 func TestRetryAttempts(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -173,7 +173,7 @@ func TestBuildSendCascadeMessageRequestUsesCascadeConfigOverrides(t *testing.T) 
 	}
 }
 
-func TestBuildSendCascadeMessageRequestSkipsNoToolOverrideForStructuredToolProtocol(t *testing.T) {
+func TestBuildSendCascadeMessageRequestDisablesNativeCodeToolsForStructuredToolProtocol(t *testing.T) {
 	systemPrompt := `Return exactly one JSON object and nothing else.
 {"action":"tool_call","tool_calls":[{"name":"search","arguments":{"q":"value"}}]}`
 
@@ -195,10 +195,17 @@ func TestBuildSendCascadeMessageRequestSkipsNoToolOverrideForStructuredToolProto
 	if HasField(convFields, 10) {
 		t.Fatalf("unexpected no-tool override for structured tool protocol")
 	}
+	if !HasField(plannerFields, 11) {
+		t.Fatalf("expected code changes override to disable native Cascade tools")
+	}
 
 	additional := GetStringField(ParseFields(GetMessageField(convFields, 12)), 2)
 	if additional != systemPrompt {
 		t.Fatalf("additional instructions = %q, want original system prompt", additional)
+	}
+	toolOverride := GetStringField(ParseFields(GetMessageField(convFields, 13)), 2)
+	if !strings.Contains(toolOverride, "Do not use Cascade-native filesystem") {
+		t.Fatalf("tool protocol override missing native-tool guard: %q", toolOverride)
 	}
 }
 
